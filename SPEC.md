@@ -148,6 +148,15 @@ El despliegue debe documentar configuración, variables de entorno, migraciones,
 - Garantizar cumplimiento de una ley, norma fiscal o certificación sin análisis de jurisdicción y auditoría formal.
 - Procesar directamente información de tarjetas o almacenar credenciales de pago.
 
-## 9. Decisiones pendientes de negocio
+## 9. Decisiones de negocio confirmadas
 
-Antes de la puesta en producción, confirmar jurisdicción, moneda/impuestos, horarios, reglas de garantía, consentimientos y retención, plantilla de documentos, canales de notificación, proveedor de identidad/pagos, volumen esperado y objetivos de disponibilidad/recuperación.
+- **Jurisdicción:** San Miguel de Tucumán, Tucumán, Argentina.
+- **Moneda:** pesos argentinos (`ARS`).
+- **Horarios:** lunes a sábado de 9:00 a 21:00 de corrido.
+- **Domingos:** cerrado.
+- **Garantías:** las condiciones y alcance deben confirmarse por teléfono al `+54 9 381 524-9553`. La aplicación no debe declarar cobertura legal o comercial hasta que la decisión quede registrada.
+- **Zona horaria operativa:** `America/Argentina/Tucuman`.
+
+## 10. Pendientes antes de producción
+
+Antes de operar con datos reales, completar: impuestos fiscales aplicables, consentimientos y retención, plantilla de documentos, canales de notificación, proveedor de identidad/pagos, volumen esperado y objetivos de disponibilidad/recuperación.

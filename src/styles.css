@@ -50,6 +50,9 @@ table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 11px 10px; border-bottom: 1px solid #edf0f5; }
 th { color: #7a8497; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
 .badge { display: inline-block; padding: 5px 8px; border-radius: 999px; background: #edf3ff; color: #3e5d96; font-size: 12px; white-space: nowrap; }
+.author-footer { min-height: 52px; border-top: 1px solid #e5e9f1; padding: 14px 32px; display: flex; justify-content: space-between; gap: 16px; color: #7a8497; font-size: 12px; background: #fff; }
+.author-footer a { color: #168d77; font-weight: 700; text-decoration: none; }
+.author-footer a:hover { text-decoration: underline; }
 
 @media (max-width: 900px) {
   .app-shell { grid-template-columns: 76px 1fr; }
@@ -73,4 +76,5 @@ th { color: #7a8497; font-size: 12px; text-transform: uppercase; letter-spacing:
   .metrics article { padding: 12px; }
   .metrics article strong { font-size: 18px; }
   .form-grid { grid-template-columns: 1fr; }
+  .author-footer { flex-direction: column; align-items: center; text-align: center; padding: 14px 16px; }
 }

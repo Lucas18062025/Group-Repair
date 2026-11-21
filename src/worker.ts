@@ -63,7 +63,21 @@ function integer(value: unknown, field: string): number {
 async function ensureWorkshop(db: D1Database): Promise<void> {
   await db.prepare(
     "INSERT OR IGNORE INTO workshops (id,name,timezone,currency,created_at) VALUES (?1,?2,?3,?4,?5)"
-  ).bind(WORKSHOP_ID, "Mi taller", "America/Argentina/Buenos_Aires", "ARS", now()).run();
+  ).bind(WORKSHOP_ID, "Mi taller", "America/Argentina/Tucuman", "ARS", now()).run();
+  await db.prepare(`
+    UPDATE workshops
+    SET timezone=?1,currency=?2,jurisdiction=?3,warranty_phone=?4,
+        opening_schedule=?5,closed_days=?6
+    WHERE id=?7
+  `).bind(
+    "America/Argentina/Tucuman",
+    "ARS",
+    "San Miguel de Tucumán, Tucumán, Argentina",
+    "+54 9 381 524-9553",
+    "Lunes a sábado de 9:00 a 21:00 de corrido",
+    "domingo",
+    WORKSHOP_ID
+  ).run();
 }
 
 async function audit(

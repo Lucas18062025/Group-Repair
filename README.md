@@ -27,6 +27,14 @@ Consulta [`SPEC.md`](SPEC.md) para el alcance funcional y criterios de aceptaci�
 
 El repositorio comienza con documentación de producto. La arquitectura, stack, aplicación ejecutable, pruebas, CI y despliegue deberán incorporarse y verificarse antes de considerar el sistema listo para uso real.
 
+## Configuración operativa
+
+- Jurisdicción: San Miguel de Tucumán, Tucumán, Argentina.
+- Moneda: pesos argentinos (`ARS`) en unidades menores enteras.
+- Horario: lunes a sábado, 9:00 a 21:00 de corrido.
+- Domingo: cerrado.
+- Consultas de garantía: `+54 9 381 524-9553`.
+
 ## Desarrollo
 
 A partir de este estado, el repositorio incluye una aplicación inicial con React, TypeScript, Vite, Cloudflare Workers y Cloudflare D1.

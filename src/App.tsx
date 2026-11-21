@@ -323,6 +323,14 @@ export default function App() {
             </article>
           </section>
         )}
+        <footer className="author-footer">
+          <span>Diseñado por <a href="https://portafolio.lucaslean1806.workers.dev/" target="_blank" rel="noreferrer">Lucas Villagra | Cybersecurity Analyst</a></span>
+          <span>
+            <a href="https://github.com/Lucas18062025/Group-Repair" target="_blank" rel="noreferrer">GitHub</a>
+            {" · "}
+            <a href="https://www.linkedin.com/in/lucas-villagra-cybersecurity" target="_blank" rel="noreferrer">LinkedIn</a>
+          </span>
+        </footer>
       </main>
     </div>
   );

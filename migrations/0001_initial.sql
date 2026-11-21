@@ -3,7 +3,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE workshops (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  timezone TEXT NOT NULL DEFAULT 'America/Argentina/Buenos_Aires',
+  timezone TEXT NOT NULL DEFAULT 'America/Argentina/Tucuman',
   currency TEXT NOT NULL DEFAULT 'ARS',
   created_at TEXT NOT NULL
 );
