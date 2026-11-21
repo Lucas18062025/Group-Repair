@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "group-repair",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-11-21",
+  "assets": {
+    "directory": "./dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "group-repair-db",
+      "database_id": "3c27f3d4-ccf0-4148-8846-5e0a2a7ea4e8"
+    }
+  ]
+}

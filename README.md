@@ -26,14 +26,32 @@ Consulta [`SPEC.md`](SPEC.md) para el alcance funcional y criterios de aceptaci�
 El repositorio comienza con documentación de producto. La arquitectura, stack, aplicación ejecutable, pruebas, CI y despliegue deberán incorporarse y verificarse antes de considerar el sistema listo para producción. No cargar datos personales reales en entornos de desarrollo.
 
 ## Desarrollo
+A partir de este estado, el repositorio incluye una aplicación inicial con React, TypeScript, Vite, Cloudflare Workers y Cloudflare D1.
 
-Aún no se ha seleccionado ni configurado una pila de aplicación, por lo que todavía no hay comandos de instalación o ejecución. Cuando se agregue el código, documentar aquí:
+Requisitos:
 
-1. Requisitos previos y versión de runtime.
-2. Instalación de dependencias y configuración local.
-3. Variables de entorno (sin valores secretos) y migraciones.
-4. Comandos de desarrollo, lint, tipos, pruebas y compilación.
-5. Arquitectura, decisiones de persistencia y límites de confianza.
+- Node.js 22 o compatible.
+- Cuenta de Cloudflare con acceso a D1 y Workers.
+- `npm`.
+
+Comandos:
+
+```powershell
+npm install
+npm run cf:types
+npm run cf:migrate
+npm run dev
+npm test
+npm run typecheck
+npm run build
+npx wrangler deploy --dry-run
+```
+
+La migración local se encuentra en `migrations/0001_initial.sql`. La configuración Cloudflare está en `wrangler.jsonc`. Los importes se representan en unidades menores enteras; no se procesan ni almacenan datos de tarjetas.
+
+## Seguridad y estado operativo
+
+La implementación actual incorpora persistencia, trazabilidad básica, máquina de estados y validaciones del dominio. No debe considerarse lista para datos reales hasta integrar autenticación de usuarios, aislamiento efectivo por sesión/taller, autorización por recurso y almacenamiento privado para adjuntos. Antes del despliegue de producción hay que configurar identidad, secretos, backups, retención y controles CSRF/CORS.
 
 ## Seguridad y privacidad
 

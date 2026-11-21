@@ -1,0 +1,37 @@
+export const ORDER_STATUSES = [
+  "RECEIVED",
+  "DIAGNOSIS",
+  "QUOTED",
+  "APPROVED",
+  "REJECTED",
+  "WAITING_FOR_PARTS",
+  "IN_REPAIR",
+  "TESTING",
+  "READY_FOR_DELIVERY",
+  "DELIVERED",
+  "NOT_REPAIRABLE",
+  "CANCELLED",
+  "REOPENED"
+] as const;
+
+export type OrderStatus = (typeof ORDER_STATUSES)[number];
+
+const transitions: Record<OrderStatus, readonly OrderStatus[]> = {
+  RECEIVED: ["DIAGNOSIS", "CANCELLED"],
+  DIAGNOSIS: ["QUOTED", "WAITING_FOR_PARTS", "NOT_REPAIRABLE", "CANCELLED"],
+  QUOTED: ["APPROVED", "REJECTED", "WAITING_FOR_PARTS", "CANCELLED"],
+  APPROVED: ["IN_REPAIR", "WAITING_FOR_PARTS", "CANCELLED"],
+  REJECTED: ["REOPENED", "CANCELLED"],
+  WAITING_FOR_PARTS: ["APPROVED", "IN_REPAIR", "CANCELLED"],
+  IN_REPAIR: ["TESTING", "WAITING_FOR_PARTS", "NOT_REPAIRABLE", "CANCELLED"],
+  TESTING: ["READY_FOR_DELIVERY", "IN_REPAIR", "NOT_REPAIRABLE"],
+  READY_FOR_DELIVERY: ["DELIVERED", "REOPENED", "CANCELLED"],
+  DELIVERED: ["REOPENED"],
+  NOT_REPAIRABLE: ["REOPENED", "CANCELLED"],
+  CANCELLED: ["REOPENED"],
+  REOPENED: ["RECEIVED", "DIAGNOSIS"]
+};
+
+export function canTransition(from: OrderStatus, to: OrderStatus): boolean {
+  return transitions[from]?.includes(to) ?? false;
+}
