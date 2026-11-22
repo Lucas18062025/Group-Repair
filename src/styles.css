@@ -154,6 +154,11 @@ th { color: #7a8497; font-size: 12px; text-transform: uppercase; letter-spacing:
 .history-filter { display: flex; align-items: end; gap: 8px; margin: 12px 0; }
 .history-filter label { display: grid; gap: 5px; color: #59647a; font-size: 12px; }
 .history-filter select { height: 40px; min-width: 220px; border: 1px solid #ccd3df; border-radius: 8px; background: #fff; padding: 0 9px; }
+.customer-toolbar { margin-bottom: 12px; }
+.customer-toolbar label { display: grid; gap: 5px; max-width: 420px; color: #59647a; font-size: 12px; }
+.customer-toolbar input { height: 40px; border: 1px solid #ccd3df; border-radius: 8px; background: #fff; padding: 0 10px; }
+.customer-table-card { padding: 0; overflow: hidden; }
+.customer-order-link { width: 100%; display: flex; justify-content: space-between; gap: 12px; border: 0; border-bottom: 1px solid #edf0f5; background: transparent; padding: 10px 0; color: #172033; cursor: pointer; }
 
 @media (max-width: 900px) {
   .app-shell { grid-template-columns: 76px 1fr; }

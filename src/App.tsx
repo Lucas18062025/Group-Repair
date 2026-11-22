@@ -59,9 +59,28 @@ interface GoogleAllowlistAccount {
 interface Customer {
   id: string;
   name: string;
+  surname: string | null;
   phone: string;
   email: string | null;
   address: string | null;
+  observations: string | null;
+  status: string;
+  owner_user_id: string | null;
+  device_count: number;
+  order_count: number;
+  created_at: string;
+}
+
+interface Device {
+  id: string;
+  customer_id: string;
+  category: string;
+  brand: string;
+  model: string;
+  serial_number: string | null;
+  physical_condition: string | null;
+  reported_fault: string | null;
+  accessories: string | null;
   created_at: string;
 }
 
@@ -194,6 +213,16 @@ export default function App() {
   const [movements, setMovements] = useState<StockMovement[]>([]);
   const [busyPartId, setBusyPartId] = useState<string | null>(null);
   const [historyKind, setHistoryKind] = useState("TODOS");
+  const [customerSearch, setCustomerSearch] = useState("");
+  const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
+  const [customerDevices, setCustomerDevices] = useState<Device[]>([]);
+  const [customerOrders, setCustomerOrders] = useState<Order[]>([]);
+  const [showCustomerForm, setShowCustomerForm] = useState(false);
+  const [customerOrderPrefill, setCustomerOrderPrefill] = useState("");
+  const [orderSearch, setOrderSearch] = useState("");
+  const [orderFilter, setOrderFilter] = useState("TODAS");
+  const [showOrderForm, setShowOrderForm] = useState(false);
+  const [availableDevices, setAvailableDevices] = useState<Device[]>([]);
 
   function navigateTab(nextTab: Tab) {
     setTab(nextTab);
@@ -342,6 +371,20 @@ export default function App() {
     return () => window.removeEventListener("popstate", syncTab);
   }, []);
 
+  useEffect(() => {
+    if (tab !== "ordenes") return;
+    void api<{ devices: Device[] }>("/api/devices")
+      .then((result) => setAvailableDevices(result.devices))
+      .catch((error) => setMessage(error instanceof Error ? error.message : "No se pudieron cargar los equipos"));
+  }, [tab]);
+
+  useEffect(() => {
+    if (!showOrderForm || !customerOrderPrefill) return;
+    void api<{ devices: Device[] }>(`/api/devices?customer=${encodeURIComponent(customerOrderPrefill)}`)
+      .then((result) => setAvailableDevices(result.devices))
+      .catch(() => setAvailableDevices([]));
+  }, [showOrderForm, customerOrderPrefill]);
+
   async function loadIntegrations() {
     try {
       const result = await api<{ connections: IntegrationConnection[] }>("/api/integrations");
@@ -469,6 +512,11 @@ export default function App() {
 
   async function submitCustomer(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para crear clientes");
+      return;
+    }
     const formElement = event.currentTarget;
     const form = new FormData(formElement);
     setBusy(true);
@@ -477,9 +525,11 @@ export default function App() {
         method: "POST",
         body: JSON.stringify({
           name: form.get("name"),
+          surname: form.get("surname"),
           phone: form.get("phone"),
           email: form.get("email"),
-          address: form.get("address")
+          address: form.get("address"),
+          observations: form.get("observations")
         })
       });
       formElement.reset();
@@ -488,6 +538,71 @@ export default function App() {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Error al guardar");
       setBusy(false);
+    }
+  }
+
+  async function openCustomer(customer: Customer) {
+    try {
+      const result = await api<{ customer: Customer; devices: Device[]; orders: Order[] }>(`/api/customers/${customer.id}`);
+      setSelectedCustomer(result.customer);
+      setCustomerDevices(result.devices);
+      setCustomerOrders(result.orders);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo abrir el detalle");
+    }
+  }
+
+  async function editCustomer(customer: Customer) {
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para editar clientes");
+      return;
+    }
+    const name = window.prompt("Nombre", customer.name);
+    if (!name?.trim()) return;
+    const surname = window.prompt("Apellido", customer.surname ?? "") ?? "";
+    const phone = window.prompt("Teléfono", customer.phone);
+    if (!phone?.trim()) return;
+    const email = window.prompt("Email", customer.email ?? "") ?? "";
+    const address = window.prompt("Dirección", customer.address ?? "") ?? "";
+    const observations = window.prompt("Observaciones", customer.observations ?? "") ?? "";
+    try {
+      await api(`/api/customers/${customer.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: name.trim(), surname: surname.trim(), phone: phone.trim(), email: email.trim(), address: address.trim(), observations: observations.trim(), status: customer.status ?? "ACTIVO" })
+      });
+      setMessage("Cliente actualizado");
+      await refresh();
+      setSelectedCustomer(null);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo editar el cliente");
+    }
+  }
+
+  async function deleteCustomer(customer: Customer) {
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para eliminar clientes");
+      return;
+    }
+    const detail = await api<{ devices: Device[]; orders: Order[] }>(`/api/customers/${customer.id}`).catch(() => null);
+    const deviceCount = detail?.devices.length ?? 0;
+    const orderCount = detail?.orders.length ?? 0;
+    const confirmation = window.prompt(
+      `Eliminar a "${customer.name}" también eliminará ${deviceCount} equipo(s) y ${orderCount} orden(es), con sus dependencias asociadas.\n\nEscribe el nombre exacto para confirmar.`,
+      ""
+    );
+    if (confirmation !== customer.name) return;
+    try {
+      await api(`/api/customers/${customer.id}`, {
+        method: "DELETE",
+        body: JSON.stringify({ confirmName: confirmation })
+      });
+      setSelectedCustomer(null);
+      setMessage("Cliente y sus datos asociados eliminados");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo eliminar el cliente");
     }
   }
 
@@ -560,12 +675,123 @@ export default function App() {
     }
   }
 
+  async function submitDirectOrder(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para crear órdenes");
+      return;
+    }
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
+    let deviceId = String(form.get("device"));
+    setBusy(true);
+    try {
+      if (!deviceId) {
+        const device = await api<{ id: string }>("/api/devices", {
+          method: "POST",
+          body: JSON.stringify({
+            customerId: form.get("customer"),
+            category: form.get("category"),
+            brand: form.get("brand"),
+            model: form.get("model"),
+            serialNumber: form.get("serial"),
+            physicalCondition: form.get("condition"),
+            reportedFault: form.get("reportedFault"),
+            accessories: form.get("accessories")
+          })
+        });
+        deviceId = device.id;
+      }
+      const created = await api<{ reference: string }>("/api/orders", {
+        method: "POST",
+        body: JSON.stringify({
+          customerId: form.get("customer"),
+          deviceId,
+          reportedIssue: form.get("reportedIssue"),
+          observations: form.get("observations"),
+          accessories: form.get("accessories"),
+          priority: form.get("priority"),
+          receivedAt: form.get("receivedAt"),
+          estimatedCompletionAt: form.get("estimated")
+        })
+      });
+      formElement.reset();
+      setCustomerOrderPrefill("");
+      setShowOrderForm(false);
+      setMessage(`Orden ${created.reference} creada`);
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo crear la orden");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function openOrder(order: Order) {
     try {
       const result = await api<{ order: Order }>(`/api/orders/${order.id}`);
       setSelectedOrder(result.order);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "No se pudo cargar el detalle");
+    }
+  }
+
+  async function editOrder(order: Order) {
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para editar órdenes");
+      return;
+    }
+    const reportedIssue = window.prompt("Problema informado", order.reported_issue);
+    if (!reportedIssue?.trim()) return;
+    const observations = window.prompt("Observaciones", order.observations ?? "") ?? "";
+    const accessories = window.prompt("Accesorios", order.accessories ?? "") ?? "";
+    try {
+      await api(`/api/orders/${order.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          reportedIssue: reportedIssue.trim(),
+          observations: observations.trim(),
+          accessories: accessories.trim(),
+          priority: order.priority,
+          estimatedCompletionAt: null,
+          receivedAt: order.received_at ?? order.created_at,
+          assignedUserId: null,
+          category: order.category ?? "Otro",
+          brand: order.brand,
+          model: order.model,
+          serialNumber: order.serial_number,
+          physicalCondition: null,
+          reportedFault: reportedIssue.trim()
+        })
+      });
+      setMessage("Orden actualizada");
+      await refresh();
+      setSelectedOrder(null);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo editar la orden");
+    }
+  }
+
+  async function changeOrderStatus(order: Order, status: string) {
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para cambiar estados");
+      return;
+    }
+    const reason = window.prompt("Motivo del cambio", "Actualización operativa");
+    if (reason === null) return;
+    try {
+      await api(`/api/orders/${order.id}/status`, {
+        method: "PATCH",
+        body: JSON.stringify({ status, reason })
+      });
+      setMessage("Estado actualizado");
+      await refresh();
+      setSelectedOrder(null);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo cambiar el estado");
     }
   }
 
@@ -930,23 +1156,64 @@ export default function App() {
         )}
 
         {tab === "clientes" && (
-          <section className="content grid-two">
-            <article className="panel-card">
-              <h2>Nuevo cliente</h2>
-              <form className="form" onSubmit={submitCustomer}>
-                <label>Nombre completo<input name="name" required /></label>
-                <label>Teléfono<input name="phone" required /></label>
-                <label>Email<input name="email" type="email" /></label>
-                <label>Dirección<input name="address" /></label>
-                <button className="primary" type="submit" disabled={busy}>Guardar cliente</button>
-              </form>
-            </article>
-            <article className="panel-card">
-              <h2>Clientes registrados</h2>
-              <div className="table-wrap"><table><thead><tr><th>Nombre</th><th>Teléfono</th><th>Email</th></tr></thead><tbody>
-                {customers.map(customer => <tr key={customer.id}><td>{customer.name}</td><td>{customer.phone}</td><td>{customer.email ?? "—"}</td></tr>)}
+          <section className="content customers-page">
+            <header className="inventory-header">
+              <div>
+                <p className="eyebrow">Cartera de clientes</p>
+                <h2>Clientes</h2>
+                <p>Consulta, edición y relaciones con equipos y órdenes.</p>
+              </div>
+              <button className="primary" type="button" onClick={() => setShowCustomerForm(true)}>Nuevo cliente</button>
+            </header>
+            <div className="customer-toolbar">
+              <label>Buscar
+                <input value={customerSearch} onChange={(event) => setCustomerSearch(event.target.value)} placeholder="Nombre, teléfono o email" />
+              </label>
+            </div>
+            <article className="panel-card customer-table-card">
+              <div className="table-wrap"><table><thead><tr><th>Cliente</th><th>Teléfono</th><th>Email</th><th>Equipos</th><th>Órdenes</th><th>Acciones</th></tr></thead><tbody>
+                {customers
+                  .filter((customer) => !customerSearch || `${customer.name} ${customer.surname ?? ""} ${customer.phone} ${customer.email ?? ""}`.toLowerCase().includes(customerSearch.toLowerCase()))
+                  .map(customer => (
+                    <tr key={customer.id}>
+                      <td><button className="product-link" type="button" onClick={() => openCustomer(customer)}><strong>{customer.name}{customer.surname ? ` ${customer.surname}` : ""}</strong><small>{customer.address ?? "Sin dirección"}</small></button></td>
+                      <td>{customer.phone}</td>
+                      <td>{customer.email ?? "—"}</td>
+                      <td>{customer.device_count ?? 0}</td>
+                      <td>{customer.order_count ?? 0}</td>
+                      <td><div className="row-actions"><button className="secondary" type="button" onClick={() => openCustomer(customer)}>Detalle</button><button className="secondary" type="button" onClick={() => editCustomer(customer)}>Editar</button><button className="danger" type="button" onClick={() => deleteCustomer(customer)}>Eliminar</button></div></td>
+                    </tr>
+                  ))}
               </tbody></table></div>
+              {!customers.filter((customer) => !customerSearch || `${customer.name} ${customer.surname ?? ""} ${customer.phone} ${customer.email ?? ""}`.toLowerCase().includes(customerSearch.toLowerCase())).length && <p className="empty">No hay clientes que coincidan.</p>}
             </article>
+
+            {showCustomerForm && (
+              <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="new-customer-title">
+                <article className="modal-card">
+                  <div className="detail-heading"><h2 id="new-customer-title">Nuevo cliente</h2><button className="overlay-close-inline" type="button" onClick={() => setShowCustomerForm(false)}>×</button></div>
+                  <form className="form form-grid" onSubmit={async (event) => { await submitCustomer(event); setShowCustomerForm(false); }}>
+                    <label>Nombre<input name="name" required /></label>
+                    <label>Apellido<input name="surname" /></label>
+                    <label>Teléfono<input name="phone" required /></label>
+                    <label>Email<input name="email" type="email" /></label>
+                    <label>Dirección<input name="address" /></label>
+                    <label>Observaciones<textarea name="observations" rows={3} /></label>
+                    <button className="primary" type="submit" disabled={busy}>Guardar cliente</button>
+                  </form>
+                </article>
+              </div>
+            )}
+
+            {selectedCustomer && (
+              <aside className="inventory-drawer" aria-label={`Detalle de ${selectedCustomer.name}`}>
+                <div className="detail-heading"><div><p className="eyebrow">Detalle del cliente</p><h2>{selectedCustomer.name}{selectedCustomer.surname ? ` ${selectedCustomer.surname}` : ""}</h2></div><button className="overlay-close-inline" type="button" onClick={() => setSelectedCustomer(null)}>×</button></div>
+                <dl className="drawer-details"><dt>Teléfono</dt><dd>{selectedCustomer.phone}</dd><dt>Email</dt><dd>{selectedCustomer.email ?? "—"}</dd><dt>Dirección</dt><dd>{selectedCustomer.address ?? "—"}</dd><dt>Observaciones</dt><dd>{selectedCustomer.observations ?? "—"}</dd></dl>
+                <div className="drawer-actions"><button className="secondary" type="button" onClick={() => editCustomer(selectedCustomer)}>Editar</button><button className="primary" type="button" onClick={() => { navigateTab("ordenes"); setCustomerOrderPrefill(selectedCustomer.id); }}>Crear orden</button><button className="danger" type="button" onClick={() => deleteCustomer(selectedCustomer)}>Eliminar</button></div>
+                <div className="drawer-history"><h3>Equipos</h3>{customerDevices.map(device => <div className="movement-row" key={device.id}><span>{device.category}</span><strong>{device.brand} {device.model}</strong><small>{device.serial_number ?? "Sin serie"} · {device.reported_fault ?? "Sin falla"}</small></div>)}{!customerDevices.length && <p className="empty">Sin equipos asociados.</p>}</div>
+                <div className="drawer-history"><h3>Órdenes</h3>{customerOrders.map(order => <button className="customer-order-link" type="button" key={order.id} onClick={() => openOrder(order)}><strong>{order.reference}</strong><span>{statusLabel(order.status)}</span></button>)}{!customerOrders.length && <p className="empty">Sin órdenes asociadas.</p>}</div>
+              </aside>
+            )}
           </section>
         )}
 
@@ -978,13 +1245,70 @@ export default function App() {
 
         {tab === "ordenes" && (
           <section className="content">
-            <article className="panel-card">
-              <h2>Órdenes de reparación</h2>
-              <div className="table-wrap"><table><thead><tr><th>Número</th><th>Cliente</th><th>Equipo</th><th>Ingreso</th><th>Estado</th><th>Técnico</th><th>Presupuesto</th><th>Acciones</th></tr></thead><tbody>
-                {orders.map(order => <tr key={order.id}><td><strong>{order.reference}</strong></td><td>{order.customer_name}<br /><small>{order.customer_phone ?? ""}</small></td><td>{order.brand} {order.model}{order.serial_number ? ` · ${order.serial_number}` : ""}</td><td>{order.received_at ? new Date(order.received_at).toLocaleString("es-AR") : new Date(order.created_at).toLocaleString("es-AR")}</td><td><span className="badge">{statusLabel(order.status)}</span></td><td>{order.technician_name ?? "Sin asignar"}</td><td>{formatMoney(order.total_minor ?? 0)}</td><td><button className="secondary" type="button" onClick={() => openOrder(order)}>Ver detalle</button></td></tr>)}
+            <header className="inventory-header">
+              <div><p className="eyebrow">Gestión de reparaciones</p><h2>Órdenes</h2><p>Seguimiento completo desde la recepción hasta la entrega.</p></div>
+              <button className="primary" type="button" onClick={() => setShowOrderForm(true)}>Nueva orden</button>
+            </header>
+            <div className="inventory-toolbar">
+              <label className="inventory-search">Buscar
+                <input value={orderSearch} onChange={(event) => setOrderSearch(event.target.value)} placeholder="Número, cliente, equipo o problema" />
+              </label>
+              <label>Estado
+                <select value={orderFilter} onChange={(event) => setOrderFilter(event.target.value)}>
+                  <option value="TODAS">Todas</option>
+                  <option value="RECEIVED">Recibidas</option>
+                  <option value="DIAGNOSIS">En diagnóstico</option>
+                  <option value="WAITING_FOR_PARTS">Esperando aprobación/repuesto</option>
+                  <option value="IN_REPAIR">En reparación</option>
+                  <option value="READY_FOR_DELIVERY">Finalizadas</option>
+                  <option value="DELIVERED">Entregadas</option>
+                  <option value="CANCELLED">Canceladas</option>
+                </select>
+              </label>
+            </div>
+            <article className="panel-card inventory-table-card">
+              <div className="table-wrap"><table className="inventory-table"><thead><tr><th>Número</th><th>Cliente</th><th>Equipo</th><th>Recepción</th><th>Estado</th><th>Técnico</th><th>Importe</th><th>Última actualización</th><th>Acciones</th></tr></thead><tbody>
+                {orders
+                  .filter((order) => orderFilter === "TODAS" || order.status === orderFilter || (orderFilter === "WAITING_FOR_PARTS" && ["WAITING_FOR_PARTS", "QUOTED", "APPROVED"].includes(order.status)) || (orderFilter === "READY_FOR_DELIVERY" && ["TESTING", "READY_FOR_DELIVERY", "NOT_REPAIRABLE"].includes(order.status)))
+                  .filter((order) => !orderSearch || `${order.reference} ${order.customer_name} ${order.brand} ${order.model} ${order.reported_issue}`.toLowerCase().includes(orderSearch.toLowerCase()))
+                  .map(order => <tr key={order.id}><td><strong>{order.reference}</strong></td><td>{order.customer_name}<br /><small>{order.customer_phone ?? ""}</small></td><td>{order.brand} {order.model}{order.serial_number ? ` · ${order.serial_number}` : ""}</td><td>{order.received_at ? new Date(order.received_at).toLocaleString("es-AR") : new Date(order.created_at).toLocaleString("es-AR")}</td><td><span className="badge">{statusLabel(order.status)}</span></td><td>{order.technician_name ?? "Sin asignar"}</td><td>{formatMoney(order.total_minor ?? 0)}</td><td>{new Date(order.created_at).toLocaleString("es-AR")}</td><td><div className="row-actions"><button className="secondary" type="button" onClick={() => openOrder(order)}>Detalle</button><button className="secondary" type="button" onClick={() => editOrder(order)}>Editar</button></div></td></tr>)}
               </tbody></table></div>
-              {!orders.length && <p className="empty">Todavía no hay órdenes.</p>}
+              {!orders.length && <p className="empty">Todavía no hay órdenes registradas. Crea la primera desde este módulo.</p>}
             </article>
+
+            {showOrderForm && (
+              <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="new-order-title">
+                <article className="modal-card">
+                  <div className="detail-heading"><h2 id="new-order-title">Nueva orden</h2><button className="overlay-close-inline" type="button" onClick={() => setShowOrderForm(false)}>×</button></div>
+                  <form className="form form-grid" onSubmit={submitDirectOrder}>
+                    <label>Cliente
+                      <select name="customer" defaultValue={customerOrderPrefill} required onChange={(event) => {
+                        const customerId = event.target.value;
+                        setCustomerOrderPrefill(customerId);
+                        if (customerId) void api<{ devices: Device[] }>(`/api/devices?customer=${encodeURIComponent(customerId)}`).then((result) => setAvailableDevices(result.devices)).catch(() => setAvailableDevices([]));
+                        else setAvailableDevices([]);
+                      }}><option value="">Seleccionar</option>{customers.map(customer => <option key={customer.id} value={customer.id}>{customer.name}{customer.surname ? ` ${customer.surname}` : ""}</option>)}</select>
+                    </label>
+                    <label>Equipo asociado
+                      <select name="device"><option value="">Registrar equipo nuevo</option>{availableDevices.filter(device => !customerOrderPrefill || device.customer_id === customerOrderPrefill).map(device => <option key={device.id} value={device.id}>{device.brand} {device.model} · {device.serial_number ?? "Sin serie"}</option>)}</select>
+                    </label>
+                    <label>Categoría<select name="category"><option>Móvil</option><option>Electrodoméstico</option><option>Electrónica</option><option>PC/Laptop</option><option>Otro</option></select></label>
+                    <label>Marca<input name="brand" /></label>
+                    <label>Modelo<input name="model" /></label>
+                    <label>Serie / IMEI<input name="serial" /></label>
+                    <label>Condición física<input name="condition" /></label>
+                    <label>Falla reportada<input name="reportedFault" /></label>
+                    <label>Accesorios<input name="accessories" /></label>
+                    <label>Problema informado<input name="reportedIssue" required /></label>
+                    <label>Observaciones<textarea name="observations" rows={3} /></label>
+                    <label>Prioridad<select name="priority"><option value="normal">Normal</option><option value="alta">Alta</option><option value="urgente">Urgente</option></select></label>
+                    <label>Fecha de recepción<input name="receivedAt" type="datetime-local" /></label>
+                    <label>Entrega estimada<input name="estimated" type="datetime-local" /></label>
+                    <button className="primary" type="submit" disabled={busy}>Guardar orden</button>
+                  </form>
+                </article>
+              </div>
+            )}
             {selectedOrder && (
               <article className="panel-card order-detail">
                 <div className="detail-heading">
@@ -1001,7 +1325,12 @@ export default function App() {
                   <dt>Técnico</dt><dd>{selectedOrder.technician_name ?? "Sin asignar"}</dd>
                   <dt>Estado</dt><dd>{statusLabel(selectedOrder.status)}</dd>
                 </dl>
-                <button className="danger" type="button" onClick={() => deleteOrder(selectedOrder.id)}>Eliminar registro vacío</button>
+                  <div className="drawer-actions">
+                    <button className="secondary" type="button" onClick={() => editOrder(selectedOrder)}>Editar orden</button>
+                    <button className="primary" type="button" onClick={() => changeOrderStatus(selectedOrder, "DIAGNOSIS")}>Pasar a diagnóstico</button>
+                    <button className="secondary" type="button" onClick={() => changeOrderStatus(selectedOrder, "CANCELLED")}>Cancelar</button>
+                    <button className="danger" type="button" onClick={() => deleteOrder(selectedOrder.id)}>Eliminar orden</button>
+                  </div>
               </article>
             )}
           </section>

@@ -137,6 +137,12 @@ async function audit(
   ).bind(uuid(), WORKSHOP_ID, null, action, entityType, entityId, metadata ? JSON.stringify(metadata) : null, now()).run();
 }
 
+function ownsOrCanAdmin(session: SessionUser | null, ownerUserId: string | null): boolean {
+  if (!session) return false;
+  if (session.role === "admin") return true;
+  return ownerUserId !== null && ownerUserId === session.id;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
@@ -683,30 +689,159 @@ export default {
 
       if (url.pathname === "/api/customers" && request.method === "GET") {
         const result = await env.DB.prepare(
-          "SELECT id,name,phone,email,address,created_at FROM customers WHERE workshop_id=?1 ORDER BY created_at DESC LIMIT 100"
+          `SELECT c.id,c.name,c.surname,c.phone,c.email,c.address,c.observations,c.status,c.owner_user_id,c.created_at,c.updated_at,
+                  COUNT(DISTINCT d.id) AS device_count,
+                  COUNT(DISTINCT ro.id) AS order_count
+           FROM customers c
+           LEFT JOIN devices d ON d.customer_id=c.id AND d.workshop_id=c.workshop_id
+           LEFT JOIN repair_orders ro ON ro.customer_id=c.id AND ro.workshop_id=c.workshop_id
+           WHERE c.workshop_id=?1
+           GROUP BY c.id
+           ORDER BY c.created_at DESC LIMIT 100`
         ).bind(WORKSHOP_ID).all();
         return json({ customers: result.results });
       }
 
       if (url.pathname === "/api/customers" && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para crear clientes" }, 401);
         const body = await readJson(request);
         const id = uuid();
         const timestamp = now();
         await env.DB.prepare(
-          "INSERT INTO customers (id,workshop_id,name,phone,email,address,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
-        ).bind(id, WORKSHOP_ID, text(body.name, "Nombre"), text(body.phone, "Teléfono"), body.email ? text(body.email, "Email") : null, body.address ? text(body.address, "Dirección") : null, timestamp, timestamp).run();
+          "INSERT INTO customers (id,workshop_id,name,surname,phone,email,address,observations,status,owner_user_id,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'ACTIVO',?9,?10,?11)"
+        ).bind(
+          id, WORKSHOP_ID,
+          text(body.name, "Nombre"),
+          body.surname ? text(body.surname, "Apellido") : null,
+          text(body.phone, "Teléfono"),
+          body.email ? text(body.email, "Email") : null,
+          body.address ? text(body.address, "Dirección") : null,
+          body.observations ? text(body.observations, "Observaciones") : null,
+          authenticatedSession.id, timestamp, timestamp
+        ).run();
         await audit(env.DB, "customer.created", "customer", id, { name: body.name });
         return json({ id }, 201);
       }
 
+      const customerMatch = url.pathname.match(/^\/api\/customers\/([^/]+)$/);
+      if (customerMatch && request.method === "GET") {
+        const customerId = customerMatch[1];
+        const customer = await env.DB.prepare(`
+          SELECT c.*,COUNT(DISTINCT d.id) AS device_count,COUNT(DISTINCT ro.id) AS order_count
+          FROM customers c
+          LEFT JOIN devices d ON d.customer_id=c.id AND d.workshop_id=c.workshop_id
+          LEFT JOIN repair_orders ro ON ro.customer_id=c.id AND ro.workshop_id=c.workshop_id
+          WHERE c.id=?1 AND c.workshop_id=?2 GROUP BY c.id
+        `).bind(customerId, WORKSHOP_ID).first();
+        if (!customer) return json({ error: "Cliente no encontrado" }, 404);
+        const [devices, orders] = await Promise.all([
+          env.DB.prepare(
+            "SELECT id,category,brand,model,serial_number,physical_condition,reported_fault,accessories,created_at FROM devices WHERE customer_id=?1 AND workshop_id=?2 ORDER BY created_at DESC"
+          ).bind(customerId, WORKSHOP_ID).all(),
+          env.DB.prepare(`
+            SELECT ro.id,ro.reference,ro.reported_issue,ro.priority,ro.status,ro.received_at,ro.created_at,ro.updated_at,
+                   d.brand,d.model
+            FROM repair_orders ro JOIN devices d ON d.id=ro.device_id
+            WHERE ro.customer_id=?1 AND ro.workshop_id=?2 ORDER BY ro.created_at DESC
+          `).bind(customerId, WORKSHOP_ID).all()
+        ]);
+        return json({ customer, devices: devices.results, orders: orders.results });
+      }
+
+      if (customerMatch && request.method === "PATCH") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para editar clientes" }, 401);
+        const customerId = customerMatch[1];
+        const existing = await env.DB.prepare(
+          "SELECT owner_user_id FROM customers WHERE id=?1 AND workshop_id=?2"
+        ).bind(customerId, WORKSHOP_ID).first<{ owner_user_id: string | null }>();
+        if (!existing) return json({ error: "Cliente no encontrado" }, 404);
+        if (!ownsOrCanAdmin(authenticatedSession, existing.owner_user_id)) {
+          return json({ error: "No tienes permiso para modificar este cliente" }, 403);
+        }
+        const body = await readJson(request);
+        await env.DB.prepare(`
+          UPDATE customers SET
+            name=?1,surname=?2,phone=?3,email=?4,address=?5,observations=?6,status=?7,updated_at=?8
+          WHERE id=?9 AND workshop_id=?10
+        `).bind(
+          text(body.name, "Nombre"),
+          body.surname ? text(body.surname, "Apellido") : null,
+          text(body.phone, "Teléfono"),
+          body.email ? text(body.email, "Email") : null,
+          body.address ? text(body.address, "Dirección") : null,
+          body.observations ? text(body.observations, "Observaciones") : null,
+          body.status ? text(body.status, "Estado").toUpperCase() : "ACTIVO",
+          now(), customerId, WORKSHOP_ID
+        ).run();
+        await audit(env.DB, "customer.updated", "customer", customerId);
+        return json({ ok: true });
+      }
+
+      if (customerMatch && request.method === "DELETE") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para eliminar clientes" }, 401);
+        const customerId = customerMatch[1];
+        const existing = await env.DB.prepare(
+          "SELECT owner_user_id,name FROM customers WHERE id=?1 AND workshop_id=?2"
+        ).bind(customerId, WORKSHOP_ID).first<{ owner_user_id: string | null; name: string }>();
+        if (!existing) return json({ error: "Cliente no encontrado" }, 404);
+        if (!ownsOrCanAdmin(authenticatedSession, existing.owner_user_id)) {
+          return json({ error: "No tienes permiso para eliminar este cliente" }, 403);
+        }
+        const dependencies = await env.DB.prepare(`
+          SELECT
+            (SELECT COUNT(*) FROM devices WHERE customer_id=?1 AND workshop_id=?2) AS devices,
+            (SELECT COUNT(*) FROM repair_orders WHERE customer_id=?1 AND workshop_id=?2) AS orders,
+            (SELECT COUNT(*) FROM quote_versions WHERE order_id IN (SELECT id FROM repair_orders WHERE customer_id=?1 AND workshop_id=?2)) AS quotes,
+            (SELECT COUNT(*) FROM diagnostics WHERE order_id IN (SELECT id FROM repair_orders WHERE customer_id=?1 AND workshop_id=?2)) AS diagnostics,
+            (SELECT COUNT(*) FROM payment_transactions WHERE order_id IN (SELECT id FROM repair_orders WHERE customer_id=?1 AND workshop_id=?2)) AS payments
+        `).bind(customerId, WORKSHOP_ID).first<{ devices: number; orders: number; quotes: number; diagnostics: number; payments: number }>();
+        const body = await readJson(request);
+        if (body.confirmName !== existing.name) {
+          return json({
+            error: "Confirmación por nombre requerida",
+            dependencies
+          }, 409);
+        }
+        await env.DB.batch([
+          env.DB.prepare("DELETE FROM quote_lines WHERE workshop_id=?1 AND quote_version_id IN (SELECT id FROM quote_versions WHERE order_id IN (SELECT id FROM repair_orders WHERE customer_id=?2))").bind(WORKSHOP_ID, customerId),
+          env.DB.prepare("DELETE FROM stock_movements WHERE workshop_id=?1 AND order_id IN (SELECT id FROM repair_orders WHERE customer_id=?2)").bind(WORKSHOP_ID, customerId),
+          env.DB.prepare("DELETE FROM payment_transactions WHERE workshop_id=?1 AND order_id IN (SELECT id FROM repair_orders WHERE customer_id=?2)").bind(WORKSHOP_ID, customerId),
+          env.DB.prepare("DELETE FROM diagnostics WHERE workshop_id=?1 AND order_id IN (SELECT id FROM repair_orders WHERE customer_id=?2)").bind(WORKSHOP_ID, customerId),
+          env.DB.prepare("DELETE FROM quote_versions WHERE workshop_id=?1 AND order_id IN (SELECT id FROM repair_orders WHERE customer_id=?2)").bind(WORKSHOP_ID, customerId),
+          env.DB.prepare("DELETE FROM order_status_events WHERE workshop_id=?1 AND order_id IN (SELECT id FROM repair_orders WHERE customer_id=?2)").bind(WORKSHOP_ID, customerId),
+          env.DB.prepare("DELETE FROM repair_orders WHERE workshop_id=?1 AND customer_id=?2").bind(WORKSHOP_ID, customerId),
+          env.DB.prepare("DELETE FROM devices WHERE workshop_id=?1 AND customer_id=?2").bind(WORKSHOP_ID, customerId),
+          env.DB.prepare("DELETE FROM customers WHERE workshop_id=?1 AND id=?2").bind(WORKSHOP_ID, customerId)
+        ]);
+        await audit(env.DB, "customer.deleted", "customer", customerId, { dependencies });
+        return json({ ok: true, deleted: { customer: 1, ...dependencies } });
+      }
+
       if (url.pathname === "/api/devices" && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para registrar equipos" }, 401);
         const body = await readJson(request);
         const id = uuid();
         await env.DB.prepare(
-          "INSERT INTO devices (id,workshop_id,customer_id,category,brand,model,serial_number,physical_condition,reported_fault,accessories,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"
-        ).bind(id, WORKSHOP_ID, text(body.customerId, "Cliente"), text(body.category, "Categoría"), text(body.brand, "Marca"), text(body.model, "Modelo"), body.serialNumber ? text(body.serialNumber, "Serie/IMEI") : null, body.physicalCondition ? text(body.physicalCondition, "Condición") : null, body.reportedFault ? text(body.reportedFault, "Falla") : null, body.accessories ? text(body.accessories, "Accesorios") : null, now()).run();
+          "INSERT INTO devices (id,workshop_id,customer_id,category,brand,model,serial_number,physical_condition,reported_fault,accessories,owner_user_id,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"
+        ).bind(id, WORKSHOP_ID, text(body.customerId, "Cliente"), text(body.category, "Categoría"), text(body.brand, "Marca"), text(body.model, "Modelo"), body.serialNumber ? text(body.serialNumber, "Serie/IMEI") : null, body.physicalCondition ? text(body.physicalCondition, "Condición") : null, body.reportedFault ? text(body.reportedFault, "Falla") : null, body.accessories ? text(body.accessories, "Accesorios") : null, authenticatedSession.id, now()).run();
         await audit(env.DB, "device.created", "device", id);
         return json({ id }, 201);
+      }
+
+      if (url.pathname === "/api/devices" && request.method === "GET") {
+        const customerId = url.searchParams.get("customer");
+        let statement: D1PreparedStatement;
+        if (customerId) {
+          statement = env.DB.prepare(
+            "SELECT id,customer_id,category,brand,model,serial_number,physical_condition,reported_fault,accessories,created_at FROM devices WHERE workshop_id=?1 AND customer_id=?2 ORDER BY created_at DESC"
+          ).bind(WORKSHOP_ID, customerId);
+        } else {
+          statement = env.DB.prepare(
+            "SELECT id,customer_id,category,brand,model,serial_number,physical_condition,reported_fault,accessories,created_at FROM devices WHERE workshop_id=?1 ORDER BY created_at DESC"
+          ).bind(WORKSHOP_ID);
+        }
+        const result = await statement.all();
+        return json({ devices: result.results });
       }
 
       if (url.pathname === "/api/orders" && request.method === "GET") {
@@ -727,6 +862,7 @@ export default {
       }
 
       if (url.pathname === "/api/orders" && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para crear órdenes" }, 401);
         const body = await readJson(request);
         const id = uuid();
         const timestamp = now();
@@ -751,7 +887,7 @@ export default {
         const receivedAt = body.receivedAt ? text(body.receivedAt, "Fecha de recepción") : timestamp;
         await env.DB.batch([
           env.DB.prepare(
-            "INSERT INTO repair_orders (id,workshop_id,customer_id,device_id,reference,reported_issue,priority,status,estimated_completion_at,received_at,observations,accessories,assigned_user_id,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"
+            "INSERT INTO repair_orders (id,workshop_id,customer_id,device_id,reference,reported_issue,priority,status,estimated_completion_at,received_at,observations,accessories,assigned_user_id,owner_user_id,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"
           ).bind(
             id, WORKSHOP_ID, customerId, deviceId, reference,
             text(body.reportedIssue, "Problema"),
@@ -762,7 +898,7 @@ export default {
             body.observations ? text(body.observations, "Observaciones") : null,
             body.accessories ? text(body.accessories, "Accesorios") : null,
             body.assignedUserId ? text(body.assignedUserId, "Técnico") : null,
-            timestamp, timestamp
+            authenticatedSession.id, timestamp, timestamp
           ),
           env.DB.prepare(
             "INSERT INTO order_status_events (id,workshop_id,order_id,from_status,to_status,actor_id,reason,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
@@ -786,21 +922,26 @@ export default {
           WHERE ro.id=?1 AND ro.workshop_id=?2
         `).bind(orderId, WORKSHOP_ID).first();
         if (!order) return json({ error: "Orden no encontrada" }, 404);
-        const [events, diagnostics, quotes] = await Promise.all([
+        const [events, diagnostics, quotes, payments] = await Promise.all([
           env.DB.prepare("SELECT * FROM order_status_events WHERE order_id=?1 AND workshop_id=?2 ORDER BY created_at DESC").bind(orderId, WORKSHOP_ID).all(),
           env.DB.prepare("SELECT * FROM diagnostics WHERE order_id=?1 AND workshop_id=?2 ORDER BY created_at DESC").bind(orderId, WORKSHOP_ID).all(),
-          env.DB.prepare("SELECT id,version,subtotal_minor,tax_minor,total_minor,status,expires_at,created_at FROM quote_versions WHERE order_id=?1 AND workshop_id=?2 ORDER BY version DESC").bind(orderId, WORKSHOP_ID).all()
+          env.DB.prepare("SELECT id,version,subtotal_minor,tax_minor,total_minor,status,expires_at,created_at FROM quote_versions WHERE order_id=?1 AND workshop_id=?2 ORDER BY version DESC").bind(orderId, WORKSHOP_ID).all(),
+          env.DB.prepare("SELECT id,kind,amount_minor,method,reference,created_at FROM payment_transactions WHERE order_id=?1 AND workshop_id=?2 ORDER BY created_at DESC").bind(orderId, WORKSHOP_ID).all()
         ]);
-        return json({ order, events: events.results, diagnostics: diagnostics.results, quotes: quotes.results });
+        return json({ order, events: events.results, diagnostics: diagnostics.results, quotes: quotes.results, payments: payments.results });
       }
 
       if (orderDetailMatch && request.method === "PATCH") {
         const orderId = orderDetailMatch[1];
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para editar órdenes" }, 401);
         const body = await readJson(request);
         const order = await env.DB.prepare(
-          "SELECT id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
-        ).bind(orderId, WORKSHOP_ID).first("id");
+          "SELECT id,owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first<{ id: string; owner_user_id: string | null }>();
         if (!order) return json({ error: "Orden no encontrada" }, 404);
+        if (!ownsOrCanAdmin(authenticatedSession, order.owner_user_id)) {
+          return json({ error: "No tienes permiso para editar esta orden" }, 403);
+        }
         await env.DB.batch([
           env.DB.prepare(`
             UPDATE repair_orders SET
@@ -836,10 +977,14 @@ export default {
 
       if (orderDetailMatch && request.method === "DELETE") {
         const orderId = orderDetailMatch[1];
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para eliminar órdenes" }, 401);
         const order = await env.DB.prepare(
-          "SELECT id,device_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
-        ).bind(orderId, WORKSHOP_ID).first<{ id: string; device_id: string }>();
+          "SELECT id,device_id,owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first<{ id: string; device_id: string; owner_user_id: string | null }>();
         if (!order) return json({ error: "Orden no encontrada" }, 404);
+        if (!ownsOrCanAdmin(authenticatedSession, order.owner_user_id)) {
+          return json({ error: "No tienes permiso para eliminar esta orden" }, 403);
+        }
         const dependencies = await env.DB.prepare(`
           SELECT
             (SELECT COUNT(*) FROM diagnostics WHERE order_id=?1) +
@@ -861,13 +1006,17 @@ export default {
 
       const statusMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/status$/);
       if (statusMatch && request.method === "PATCH") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para cambiar estados" }, 401);
         const body = await readJson(request);
         const orderId = statusMatch[1];
         const toStatus = text(body.status, "Estado").toUpperCase() as OrderStatus;
         const order = await env.DB.prepare(
-          "SELECT status FROM repair_orders WHERE id=?1 AND workshop_id=?2"
-        ).bind(orderId, WORKSHOP_ID).first<{ status: OrderStatus }>("status");
+          "SELECT status,owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first<{ status: OrderStatus; owner_user_id: string | null }>();
         if (!order) return json({ error: "Orden no encontrada" }, 404);
+        if (!ownsOrCanAdmin(authenticatedSession, order.owner_user_id)) {
+          return json({ error: "No tienes permiso para cambiar esta orden" }, 403);
+        }
         if (!canTransition(order.status, toStatus)) {
           return json({ error: `Transición inválida: ${order.status} → ${toStatus}` }, 409);
         }

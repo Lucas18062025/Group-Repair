@@ -32,6 +32,12 @@ El stock se calcula exclusivamente desde movimientos de inventario. Al crear un 
 El módulo Inventario permite operaciones rápidas de una unidad, ajustes manuales con motivo, filtros, detalle lateral, archivo/reactivación e historial de movimientos. Los movimientos incluyen referencia única, stock anterior y posterior.
 
 Las modificaciones de inventario requieren una sesión aprobada. El acceso público temporal conserva solamente consultas generales y no sustituye autorización para administrar productos o stock.
+
+## Clientes y órdenes
+
+Clientes y órdenes pueden administrarse mediante operaciones persistidas en D1. Las operaciones de creación, edición y eliminación requieren una sesión aprobada y validan propiedad de los registros; los registros históricos sin propietario quedan disponibles para administración por usuarios administradores sin reasignación automática.
+
+La eliminación de un cliente con dependencias conserva integridad mediante una operación transaccional que identifica equipos y elimina sus órdenes y registros asociados solo después de confirmar el nombre del cliente.
 ## Despliegue (Cloudflare)
 
 La aplicación está desplegada en Cloudflare Workers: [https://group-repair.lucaslean1806.workers.dev/](https://group-repair.lucaslean1806.workers.dev/).
