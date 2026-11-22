@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 
-type Tab = "panel" | "clientes" | "equipos" | "ordenes" | "inventario" | "integraciones" | "gemini";
+type Tab = "panel" | "clientes" | "equipos" | "ordenes" | "inventario" | "integraciones" | "gemini" | "asistencia";
 
 declare global {
   interface Window {
@@ -136,6 +136,24 @@ interface StockMovement {
   part_name?: string;
 }
 
+interface AssistantRequest {
+  id: string;
+  reference: string;
+  name: string;
+  phone: string;
+  email: string | null;
+  equipment_type: string | null;
+  brand: string | null;
+  model: string | null;
+  problem: string;
+  accessories: string | null;
+  request_type: string;
+  status: string;
+  order_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 interface Dashboard {
   ordersByStatus: Array<{ status: string; count: number }>;
   customerCount: number;
@@ -180,7 +198,7 @@ function statusLabel(status: string): string {
 export default function App() {
   const initialTab = new URLSearchParams(window.location.search).get("tab");
   const [tab, setTab] = useState<Tab>(
-    ["panel", "clientes", "equipos", "ordenes", "inventario", "integraciones", "gemini"].includes(initialTab ?? "")
+    ["panel", "clientes", "equipos", "ordenes", "inventario", "integraciones", "gemini", "asistencia"].includes(initialTab ?? "")
       ? (initialTab as Tab)
       : "panel"
   );
@@ -223,6 +241,20 @@ export default function App() {
   const [orderFilter, setOrderFilter] = useState("TODAS");
   const [showOrderForm, setShowOrderForm] = useState(false);
   const [availableDevices, setAvailableDevices] = useState<Device[]>([]);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatPublicKey, setChatPublicKey] = useState<string | null>(null);
+  const [chatConversationId, setChatConversationId] = useState<string | null>(null);
+  const [chatMessages, setChatMessages] = useState<Array<{ role: "assistant" | "customer"; content: string }>>([
+    { role: "assistant", content: "¡Hola! Bienvenido a Group Repair.\n\nSoy el asistente virtual del taller. Puedo ayudarte a consultar reparaciones, conocer nuestros servicios o solicitar asistencia técnica.\n\n¿Qué necesitás hoy?" }
+  ]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatFlow, setChatFlow] = useState<"IDLE" | "REPAIR" | "REPAIR_CONFIRM" | "CONTACT">("IDLE");
+  const [repairDraft, setRepairDraft] = useState<Record<string, string>>({});
+  const [assistantRequests, setAssistantRequests] = useState<AssistantRequest[]>([]);
+  const [knowledgeCategory, setKnowledgeCategory] = useState("Horarios");
+  const [knowledgeQuestion, setKnowledgeQuestion] = useState("");
+  const [knowledgeAnswer, setKnowledgeAnswer] = useState("");
 
   function navigateTab(nextTab: Tab) {
     setTab(nextTab);
@@ -363,7 +395,7 @@ export default function App() {
   useEffect(() => {
     const syncTab = () => {
       const route = new URLSearchParams(window.location.search).get("tab");
-      if (route && ["panel", "clientes", "equipos", "ordenes", "inventario", "integraciones", "gemini"].includes(route)) {
+      if (route && ["panel", "clientes", "equipos", "ordenes", "inventario", "integraciones", "gemini", "asistencia"].includes(route)) {
         setTab(route as Tab);
       }
     };
@@ -411,6 +443,58 @@ export default function App() {
         .catch((error) => setMessage(error instanceof Error ? error.message : "No se pudieron cargar usuarios"));
     }
   }, [tab, authUser]);
+
+  useEffect(() => {
+    if (authUser?.status === "APPROVED" && ["admin", "reception", "technical_lead"].includes(authUser.role) && tab === "asistencia") {
+      void api<{ requests: AssistantRequest[] }>("/api/admin/assistant/requests")
+        .then((result) => setAssistantRequests(result.requests))
+        .catch((error) => setMessage(error instanceof Error ? error.message : "No se pudieron cargar las solicitudes"));
+    }
+  }, [tab, authUser]);
+
+  async function updateAssistantRequestStatus(requestId: string, status: string) {
+    try {
+      await api(`/api/admin/assistant/requests/${requestId}/status`, {
+        method: "PATCH",
+        body: JSON.stringify({ status })
+      });
+      setAssistantRequests((requests) => requests.map((request) => request.id === requestId ? { ...request, status } : request));
+      setMessage("Estado de asistencia actualizado");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo actualizar la solicitud");
+    }
+  }
+
+  async function convertAssistantRequest(requestId: string) {
+    if (!window.confirm("¿Crear una orden real a partir de esta solicitud aprobada?")) return;
+    try {
+      const result = await api<{ reference: string }>(`/api/admin/assistant/requests/${requestId}/convert`, { method: "POST" });
+      setAssistantRequests((requests) => requests.map((request) => request.id === requestId ? { ...request, status: "RESUELTA", order_id: result.reference } : request));
+      setMessage(`Solicitud convertida en orden ${result.reference}`);
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo convertir la solicitud");
+    }
+  }
+
+  async function addKnowledge(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    try {
+      await api("/api/admin/assistant/knowledge", {
+        method: "POST",
+        body: JSON.stringify({
+          category: knowledgeCategory,
+          question: knowledgeQuestion,
+          answer: knowledgeAnswer
+        })
+      });
+      setKnowledgeQuestion("");
+      setKnowledgeAnswer("");
+      setMessage("Conocimiento agregado");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo guardar el conocimiento");
+    }
+  }
 
   async function startIntegration(service: "google_drive" | "google_sheets" | "google_photos") {
     try {
@@ -508,6 +592,213 @@ export default function App() {
     } finally {
       setBusy(false);
     }
+  }
+
+  async function startChat() {
+    if (chatPublicKey) {
+      setChatOpen(true);
+      return;
+    }
+    setChatBusy(true);
+    try {
+      const result = await api<{ publicKey: string; conversationId: string }>("/api/assistant/conversations", {
+        method: "POST",
+        body: JSON.stringify({ consent: false })
+      });
+      setChatPublicKey(result.publicKey);
+      setChatConversationId(result.conversationId);
+      setChatOpen(true);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo iniciar la asistencia");
+    } finally {
+      setChatBusy(false);
+    }
+  }
+
+  async function sendChatMessage(message?: string) {
+    const textMessage = (message ?? chatInput).trim();
+    if (!textMessage || chatBusy || !chatPublicKey) return;
+    setChatInput("");
+    setChatMessages((messages) => [...messages, { role: "customer", content: textMessage }]);
+    setChatBusy(true);
+    try {
+      const result = await api<{ reply: string; limitedAi: boolean }>("/api/assistant/messages", {
+        method: "POST",
+        body: JSON.stringify({ publicKey: chatPublicKey, message: textMessage })
+      });
+      setChatMessages((messages) => [...messages, { role: "assistant", content: result.reply }]);
+    } catch (error) {
+      setChatMessages((messages) => [...messages, {
+        role: "assistant",
+        content: error instanceof Error ? error.message : "No se pudo procesar el mensaje."
+      }]);
+    } finally {
+      setChatBusy(false);
+    }
+  }
+
+  async function beginRepairRequest() {
+    setChatFlow("REPAIR");
+    setRepairDraft({});
+    setChatMessages((messages) => [...messages,
+      { role: "assistant", content: "Vamos a registrar tu solicitud. ¿Cuál es tu nombre completo?" }
+    ]);
+  }
+
+  async function beginContactRequest() {
+    setChatFlow("CONTACT");
+    setRepairDraft({});
+    setChatMessages((messages) => [...messages,
+      { role: "assistant", content: "Indicame tu nombre completo." }
+    ]);
+  }
+
+  async function handleChatRepair(message: string) {
+    const fields = ["name", "phone", "equipmentType", "brand", "model", "problem", "accessories"];
+    const nextIndex = fields.findIndex((field) => !(repairDraft[field]?.trim()));
+    if (nextIndex < 0) return;
+    const field = fields[nextIndex];
+    const labels: Record<string, string> = {
+      name: "nombre",
+      phone: "teléfono",
+      equipmentType: "tipo de equipo",
+      brand: "marca",
+      model: "modelo",
+      problem: "descripción del problema",
+      accessories: "accesorios entregados"
+    };
+    const nextDraft = { ...repairDraft, [field]: message };
+    setRepairDraft(nextDraft);
+    const remaining = fields.find((item) => !(nextDraft[item]?.trim()));
+    if (remaining) {
+      const prompts: Record<string, string> = {
+        phone: "¿Cuál es tu teléfono de contacto?",
+        equipmentType: "¿Qué tipo de equipo es?",
+        brand: "¿Qué marca tiene?",
+        model: "¿Qué modelo es?",
+        problem: "Contame brevemente cuál es el problema.",
+        accessories: "¿Qué accesorios entregás? Si no entregás accesorios, escribí «ninguno»."
+      };
+      setChatMessages((messages) => [...messages, { role: "assistant", content: prompts[remaining] ?? `¿Cuál es el ${labels[remaining]}?` }]);
+      return;
+    }
+    setChatFlow("REPAIR_CONFIRM");
+    setChatMessages((messages) => [...messages, {
+      role: "assistant",
+      content: `Resumen:\nNombre: ${nextDraft.name}\nTeléfono: ${nextDraft.phone}\nEquipo: ${nextDraft.equipmentType} ${nextDraft.brand} ${nextDraft.model}\nProblema: ${nextDraft.problem}\nAccesorios: ${nextDraft.accessories}\n\n¿Confirmás que querés enviar la solicitud?`
+    }]);
+  }
+
+  async function confirmRepairRequest() {
+    if (!chatPublicKey) return;
+    setChatBusy(true);
+    try {
+      const result = await api<{ reference: string; message: string }>("/api/assistant/requests", {
+        method: "POST",
+        body: JSON.stringify({
+          publicKey: chatPublicKey,
+          requestType: "REPAIR",
+          consent: true,
+          name: repairDraft.name,
+          phone: repairDraft.phone,
+          equipmentType: repairDraft.equipmentType,
+          brand: repairDraft.brand,
+          model: repairDraft.model,
+          problem: repairDraft.problem,
+          accessories: repairDraft.accessories
+        })
+      });
+      setChatMessages((messages) => [...messages, {
+        role: "assistant",
+        content: `${result.message}\nReferencia: ${result.reference}`
+      }]);
+      setChatFlow("IDLE");
+      setRepairDraft({});
+    } catch (error) {
+      setChatMessages((messages) => [...messages, {
+        role: "assistant",
+        content: error instanceof Error ? error.message : "No se pudo registrar la solicitud"
+      }]);
+    } finally {
+      setChatBusy(false);
+    }
+  }
+
+  async function submitChatText() {
+    if (chatFlow === "REPAIR_CONFIRM") {
+      const message = chatInput.trim();
+      setChatInput("");
+      setChatMessages((messages) => [...messages, { role: "customer", content: message }]);
+      if (/^(sí|si|confirmo|correcto|envialo|acepto)$/i.test(message)) {
+        await confirmRepairRequest();
+      } else if (/^(no|cancelar|editar|corregir)$/i.test(message)) {
+        setChatFlow("REPAIR");
+        setRepairDraft({});
+        setChatMessages((messages) => [...messages, { role: "assistant", content: "Entendido. Empecemos de nuevo. ¿Cuál es tu nombre completo?" }]);
+      } else {
+        setChatMessages((messages) => [...messages, { role: "assistant", content: "Respondé «sí» para confirmar o «no» para corregir los datos." }]);
+      }
+      return;
+    }
+    if (chatFlow === "REPAIR") {
+      const message = chatInput.trim();
+      if (!message) return;
+      setChatInput("");
+      setChatMessages((messages) => [...messages, { role: "customer", content: message }]);
+      await handleChatRepair(message);
+      return;
+    }
+    if (chatFlow === "CONTACT") {
+      const message = chatInput.trim();
+      if (!message) return;
+      setChatInput("");
+      setChatMessages((messages) => [...messages, { role: "customer", content: message }]);
+      if (!repairDraft.name) {
+        setRepairDraft({ name: message });
+        setChatMessages((messages) => [...messages, { role: "assistant", content: "¿Cuál es tu teléfono de contacto?" }]);
+      } else if (!repairDraft.phone) {
+        setRepairDraft((draft) => ({ ...draft, phone: message }));
+        setChatMessages((messages) => [...messages, { role: "assistant", content: "¿Cuál es el motivo de contacto?" }]);
+      } else if (!repairDraft.problem) {
+        const draft: Record<string, string> = { ...repairDraft, problem: message };
+        setRepairDraft(draft);
+        setChatBusy(true);
+        try {
+          const result = await api<{ reference: string; message: string }>("/api/assistant/requests", {
+            method: "POST",
+            body: JSON.stringify({
+              publicKey: chatPublicKey,
+              requestType: "CONTACT",
+              consent: true,
+              name: draft.name,
+              phone: draft.phone,
+              problem: draft.problem
+            })
+          });
+          setChatMessages((messages) => [...messages, { role: "assistant", content: `${result.message}\nReferencia: ${result.reference}` }]);
+          setChatFlow("IDLE");
+          setRepairDraft({});
+        } catch (error) {
+          setChatMessages((messages) => [...messages, { role: "assistant", content: error instanceof Error ? error.message : "No se pudo registrar el contacto" }]);
+        } finally {
+          setChatBusy(false);
+        }
+      }
+      return;
+    }
+    await sendChatMessage();
+  }
+
+  async function closeChatConversation() {
+    if (chatPublicKey) {
+      try {
+        await api(`/api/assistant/conversations/${encodeURIComponent(chatPublicKey)}`, { method: "PATCH" });
+      } catch {
+        // El cierre visual también protege la interacción aunque falle la red.
+      }
+    }
+    setChatOpen(false);
+    setChatFlow("IDLE");
   }
 
   async function submitCustomer(event: FormEvent<HTMLFormElement>) {
@@ -1047,6 +1338,43 @@ export default function App() {
           </main>
         </div>
       )}
+      {!chatOpen && (
+        <button className="assistant-fab" type="button" aria-label="Abrir asistencia de Group Repair" onClick={() => void startChat()}>
+          <span aria-hidden="true">AI</span>
+          <small>Asistencia</small>
+        </button>
+      )}
+      {chatOpen && (
+        <aside className="assistant-widget" aria-label="Asistente virtual de Group Repair">
+          <header className="assistant-widget-header">
+            <div className="assistant-agent"><span aria-hidden="true">GR</span><div><strong>Asistente Group Repair</strong><small><i /> Disponible · modo informado</small></div></div>
+            <button type="button" aria-label="Finalizar conversación" onClick={() => void closeChatConversation()}>×</button>
+          </header>
+          <div className="assistant-messages" aria-live="polite">
+            {chatMessages.map((message, index) => (
+              <div className={`assistant-message ${message.role}`} key={`${index}-${message.role}`}>
+                <span>{message.role === "assistant" ? "Asistente" : "Vos"}</span>
+                <p>{message.content}</p>
+              </div>
+            ))}
+            {chatBusy && <div className="assistant-thinking"><span /><span /><span /> Procesando</div>}
+          </div>
+          {chatFlow === "IDLE" && (
+            <div className="assistant-quick-actions">
+              <button type="button" onClick={() => void beginRepairRequest()}>Solicitar reparación</button>
+              <button type="button" onClick={() => void sendChatMessage("Consultar estado de reparación")}>Consultar estado</button>
+              <button type="button" onClick={() => void sendChatMessage("Consultar servicios")}>Consultar servicios</button>
+              <button type="button" onClick={() => void sendChatMessage("Consultar presupuesto")}>Consultar presupuesto</button>
+              <button type="button" onClick={() => void beginContactRequest()}>Hablar con el taller</button>
+            </div>
+          )}
+          <form className="assistant-compose" onSubmit={(event) => { event.preventDefault(); void submitChatText(); }}>
+            <input value={chatInput} onChange={(event) => setChatInput(event.target.value)} maxLength={2000} placeholder="Escribí tu consulta..." disabled={chatBusy} />
+            <button type="submit" disabled={chatBusy || !chatInput.trim()} aria-label="Enviar mensaje">Enviar</button>
+          </form>
+          <footer className="assistant-consent">Al enviar, aceptás el tratamiento de la información necesaria para gestionar tu consulta.</footer>
+        </aside>
+      )}
       <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
@@ -1061,7 +1389,8 @@ export default function App() {
             ["ordenes", "Órdenes"],
             ["inventario", "Inventario"],
             ["integraciones", "Integraciones"],
-            ["gemini", "Inteligencia"]
+            ["gemini", "Inteligencia"],
+            ["asistencia", "Asistencia"]
           ] as Array<[Tab, string]>).map(([key, label]) => (
             <button key={key} className={tab === key ? "active" : ""} onClick={() => navigateTab(key)}>{label}</button>
           ))}
@@ -1070,7 +1399,7 @@ export default function App() {
 
       <main>
         <header className="topbar">
-          <div><p className="eyebrow">Gestión operativa</p><h1>{tab === "panel" ? "Panel general" : tab === "gemini" ? "Group Repair Intelligence" : tab[0].toUpperCase() + tab.slice(1)}</h1></div>
+          <div><p className="eyebrow">Gestión operativa</p><h1>{tab === "panel" ? "Panel general" : tab === "gemini" ? "Group Repair Intelligence" : tab === "asistencia" ? "Asistencia / Conversaciones" : tab[0].toUpperCase() + tab.slice(1)}</h1></div>
           <div className="topbar-actions">
             {busy && <span className="loading">Actualizando</span>}
             {authUser?.status === "APPROVED" ? (
@@ -1652,6 +1981,51 @@ export default function App() {
                   </table>
                 </div>
                 </article>
+              </>
+            )}
+          </section>
+        )}
+
+        {tab === "asistencia" && (
+          <section className="content">
+            {!authUser || !["admin", "reception", "technical_lead"].includes(authUser.role) ? (
+              <article className="panel-card"><h2>Asistencia / Conversaciones</h2><p className="empty">Se requiere una sesión aprobada del personal.</p><button className="primary" type="button" onClick={() => setShowLoginOverlay(true)}>Acceso administrativo</button></article>
+            ) : (
+              <>
+              <article className="panel-card">
+                <h2>Solicitudes de atención</h2>
+                <div className="table-wrap"><table><thead><tr><th>Referencia</th><th>Tipo</th><th>Cliente</th><th>Problema / motivo</th><th>Estado</th><th>Fecha</th><th>Acciones</th></tr></thead><tbody>
+                  {assistantRequests.map((request) => (
+                    <tr key={request.id}>
+                      <td><strong>{request.reference}</strong></td>
+                      <td>{request.request_type === "REPAIR" ? "Reparación" : "Contacto"}</td>
+                      <td>{request.name}<br /><small>{request.phone}</small></td>
+                      <td>{request.problem}</td>
+                      <td><span className="badge">{request.status}</span></td>
+                      <td>{new Date(request.created_at).toLocaleString("es-AR")}</td>
+                      <td><div className="row-actions">
+                        <select aria-label={`Estado de ${request.reference}`} value={request.status} onChange={(event) => updateAssistantRequestStatus(request.id, event.target.value)}>
+                          {["NUEVA", "EN REVISION", "ESPERANDO CLIENTE", "DERIVADA", "RESUELTA", "CERRADA"].map((status) => <option key={status} value={status}>{status}</option>)}
+                        </select>
+                        {request.request_type === "REPAIR" && !request.order_id && <button className="secondary" type="button" onClick={() => convertAssistantRequest(request.id)}>Convertir en orden</button>}
+                        {request.order_id && <small>Orden: {request.order_id}</small>}
+                      </div></td>
+                    </tr>
+                  ))}
+                </tbody></table></div>
+                {!assistantRequests.length && <p className="empty">Todavía no hay solicitudes de asistencia.</p>}
+              </article>
+              <article className="panel-card admin-users">
+                <h2>Base de conocimiento</h2>
+                <form className="form form-grid" onSubmit={addKnowledge}>
+                  <label>Categoría<select value={knowledgeCategory} onChange={(event) => setKnowledgeCategory(event.target.value)}>
+                    <option>Reparación de celulares</option><option>Reparación de electrodomésticos</option><option>Microsoldadura</option><option>Diagnóstico</option><option>Presupuestos</option><option>Garantías</option><option>Tiempos</option><option>Horarios</option><option>Ubicación y contacto</option>
+                  </select></label>
+                  <label>Pregunta<input value={knowledgeQuestion} onChange={(event) => setKnowledgeQuestion(event.target.value)} maxLength={500} required /></label>
+                  <label>Respuesta<textarea value={knowledgeAnswer} onChange={(event) => setKnowledgeAnswer(event.target.value)} maxLength={2000} required /></label>
+                  <button className="primary" type="submit" disabled={busy}>Agregar conocimiento</button>
+                </form>
+              </article>
               </>
             )}
           </section>

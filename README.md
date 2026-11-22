@@ -38,6 +38,12 @@ Las modificaciones de inventario requieren una sesión aprobada. El acceso públ
 Clientes y órdenes pueden administrarse mediante operaciones persistidas en D1. Las operaciones de creación, edición y eliminación requieren una sesión aprobada y validan propiedad de los registros; los registros históricos sin propietario quedan disponibles para administración por usuarios administradores sin reasignación automática.
 
 La eliminación de un cliente con dependencias conserva integridad mediante una operación transaccional que identifica equipos y elimina sus órdenes y registros asociados solo después de confirmar el nombre del cliente.
+
+## Asistente virtual de clientes
+
+El asistente público funciona con respuestas basadas en reglas y puede reutilizar `GEMINI_API_KEY` desde Cloudflare cuando esté configurado. No expone la clave al frontend.
+
+Las conversaciones y solicitudes se guardan en D1 con consentimiento, límites de longitud, rate limiting y referencias públicas aleatorias. El seguimiento de órdenes exige número de orden y teléfono coincidente. El personal autorizado revisa solicitudes desde `/?tab=asistencia` y puede convertirlas a órdenes reales sin crear confirmaciones automáticas.
 ## Despliegue (Cloudflare)
 
 La aplicación está desplegada en Cloudflare Workers: [https://group-repair.lucaslean1806.workers.dev/](https://group-repair.lucaslean1806.workers.dev/).

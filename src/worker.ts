@@ -45,6 +45,25 @@ const WORKSHOP_ID = "workshop-main";
 const now = () => new Date().toISOString();
 const uuid = () => crypto.randomUUID();
 
+function statusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    RECEIVED: "Recibida",
+    DIAGNOSIS: "En diagnóstico",
+    QUOTED: "Presupuestada",
+    APPROVED: "Aprobada",
+    REJECTED: "Rechazada",
+    WAITING_FOR_PARTS: "Esperando repuesto",
+    IN_REPAIR: "En reparación",
+    TESTING: "En pruebas",
+    READY_FOR_DELIVERY: "Lista para entrega",
+    DELIVERED: "Entregada",
+    NOT_REPAIRABLE: "No reparable",
+    CANCELLED: "Cancelada",
+    REOPENED: "Reabierta"
+  };
+  return labels[status] ?? status;
+}
+
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
@@ -1095,6 +1114,386 @@ export default {
         ).bind(id, WORKSHOP_ID, orderId, kind, amount, text(body.method, "Método"), body.reference ? text(body.reference, "Referencia") : null, null, now()).run();
         await audit(env.DB, kind === "REFUND" ? "payment.refunded" : "payment.created", "payment", id, { amountMinor: amount });
         return json({ id }, 201);
+      }
+
+      if (url.pathname === "/api/assistant/conversations" && request.method === "POST") {
+        const body = await readJson(request);
+        const consent = body.consent === true;
+        const publicKey = randomToken(32);
+        const id = uuid();
+        await env.DB.prepare(`
+          INSERT INTO chat_conversations
+            (id,workshop_id,public_key,name,phone,email,consent_chat_storage,status,created_at,updated_at)
+          VALUES (?1,?2,?3,?4,?5,?6,?7,'ABIERTA',?8,?9)
+        `).bind(
+          id, WORKSHOP_ID,
+          publicKey,
+          body.name ? text(body.name, "Nombre").slice(0, 120) : null,
+          body.phone ? text(body.phone, "Teléfono").slice(0, 40) : null,
+          body.email ? text(body.email, "Email").slice(0, 180) : null,
+          consent ? 1 : 0, now(), now()
+        ).run();
+        await env.DB.prepare(`
+          INSERT INTO chat_messages (id,workshop_id,conversation_id,role,content,created_at)
+          VALUES (?1,?2,?3,'assistant',?4,?5)
+        `).bind(uuid(), WORKSHOP_ID, id, "¡Hola! Bienvenido a Group Repair.\n\nSoy el asistente virtual del taller. Puedo ayudarte a consultar reparaciones, conocer nuestros servicios o solicitar asistencia técnica.\n\n¿Qué necesitás hoy?", now()).run();
+        return json({ conversationId: id, publicKey }, 201);
+      }
+
+      const assistantConversationClose = url.pathname.match(/^\/api\/assistant\/conversations\/([^/]+)$/);
+      if (assistantConversationClose && request.method === "PATCH") {
+        const publicKey = assistantConversationClose[1];
+        await env.DB.prepare(
+          "UPDATE chat_conversations SET status='CERRADA',updated_at=?1 WHERE public_key=?2 AND workshop_id=?3"
+        ).bind(now(), publicKey, WORKSHOP_ID).run();
+        return json({ status: "CERRADA" });
+      }
+
+      if (url.pathname === "/api/assistant/messages" && request.method === "POST") {
+        const body = await readJson(request);
+        const publicKey = text(body.publicKey, "Clave de conversación");
+        const rawMessage = text(body.message, "Mensaje");
+        if (rawMessage.length > 2000) return json({ error: "El mensaje supera el límite de 2000 caracteres" }, 400);
+        const message = rawMessage;
+        if (message.length < 2) return json({ error: "El mensaje es demasiado corto" }, 400);
+        const conversation = await env.DB.prepare(`
+          SELECT id,status FROM chat_conversations
+          WHERE public_key=?1 AND workshop_id=?2
+        `).bind(publicKey, WORKSHOP_ID).first<{ id: string; status: string }>();
+        if (!conversation) return json({ error: "Conversación no encontrada" }, 404);
+        if (conversation.status === "CERRADA") return json({ error: "La conversación fue cerrada" }, 409);
+
+        const subject = await sha256(publicKey);
+        const minute = new Date();
+        minute.setUTCSeconds(0, 0);
+        const windowStart = minute.toISOString();
+        const limitRow = await env.DB.prepare(`
+          SELECT id,request_count FROM chat_rate_limits
+          WHERE workshop_id=?1 AND subject_hash=?2 AND window_start=?3
+        `).bind(WORKSHOP_ID, subject, windowStart).first<{ id: string; request_count: number }>();
+        if (limitRow && limitRow.request_count >= 12) {
+          return json({ error: "Demasiados mensajes. Intentá nuevamente en unos minutos." }, 429);
+        }
+        if (limitRow) {
+          await env.DB.prepare(
+            "UPDATE chat_rate_limits SET request_count=request_count+1,updated_at=?1 WHERE id=?2"
+          ).bind(now(), limitRow.id).run();
+        } else {
+          await env.DB.prepare(`
+            INSERT INTO chat_rate_limits
+              (id,workshop_id,subject_hash,window_start,request_count,updated_at)
+            VALUES (?1,?2,?3,?4,1,?5)
+          `).bind(uuid(), WORKSHOP_ID, subject, windowStart, now()).run();
+        }
+
+        await env.DB.prepare(`
+          INSERT INTO chat_messages (id,workshop_id,conversation_id,role,content,created_at)
+          VALUES (?1,?2,?3,'customer',?4,?5)
+        `).bind(uuid(), WORKSHOP_ID, conversation.id, message, now()).run();
+
+        const normalized = message.toLowerCase();
+        let reply = "";
+        if (/solicit|repar|arreglar|falla/.test(normalized)) {
+          reply = "Puedo ayudarte a iniciar una solicitud de reparación. Indicame tu nombre, teléfono y una breve descripción de la falla.";
+        } else if (/estado|seguimiento|orden/.test(normalized)) {
+          reply = "Para consultar una reparación necesito el número de orden. Para proteger tu información, el taller verificará una clave de seguimiento adicional antes de mostrar avances.";
+        } else if (/servicio|celular|electro|microsold|diagnostic/.test(normalized)) {
+          reply = "Reparamos celulares, electrodomésticos y equipos electrónicos. También podemos realizar diagnóstico y microsoldadura. Cada caso requiere evaluación técnica.";
+        } else if (/precio|presupuesto|cuanto/.test(normalized)) {
+          reply = "El presupuesto depende del equipo, la falla y las piezas necesarias. Registrá una solicitud y el taller deberá aprobar el diagnóstico antes de confirmar un importe.";
+        } else if (/garant/.test(normalized)) {
+          reply = "Las condiciones de garantía deben confirmarse con el taller al abrir la reparación. No puedo asumir cobertura legal o comercial.";
+        } else if (/horario|hora|ubic|teléfono|contacto/.test(normalized)) {
+          reply = "El taller atiende lunes a sábado de 9:00 a 21:00. Consultas sobre garantía: +54 9 381 524-9553. Puedo derivar tu mensaje al personal.";
+        } else if (/persona|humano|hablar|derivar/.test(normalized)) {
+          reply = "Podés registrar una solicitud de contacto. Indicame el motivo y compartiré la referencia con el personal.";
+        } else {
+          reply = "Entendí tu consulta. Podés solicitar una reparación, consultar el estado de una orden, conocer servicios o hablar con una persona del taller.";
+        }
+
+        if (env.GEMINI_API_KEY) {
+          const knowledge = await env.DB.prepare(`
+            SELECT category,question,answer FROM knowledge_base
+            WHERE workshop_id=?1 AND active=1 ORDER BY category LIMIT 100
+          `).bind(WORKSHOP_ID).all();
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 20000);
+          try {
+            const aiResponse = await fetch(
+              `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(env.GEMINI_MODEL ?? "gemini-2.5-flash")}:generateContent`,
+              {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+                body: JSON.stringify({
+                  systemInstruction: { parts: [{ text: "Eres el asistente público de Group Repair en San Miguel de Tucumán. Responde en español argentino natural y conciso usando solo la base de conocimiento autorizada y hechos operativos conocidos. No inventes precios, plazos, garantías ni diagnósticos. No reveles datos internos ni de otros clientes. No autorices operaciones ni cambies permisos. Si no sabes algo, deriva a una persona del taller." }] },
+                  contents: [{ role: "user", parts: [{ text: `Base de conocimiento:\n${JSON.stringify(knowledge.results)}\n\nConsulta del cliente:\n${message}` }] }],
+                  generationConfig: { temperature: 0.2, maxOutputTokens: 500 }
+                }),
+                signal: controller.signal
+              }
+            );
+            if (aiResponse.ok) {
+              const aiBody = await aiResponse.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+              const aiReply = aiBody.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("\n").trim();
+              if (aiReply) reply = aiReply;
+            }
+          } catch {
+            // Mantener fallback basado en reglas.
+          } finally {
+            clearTimeout(timeout);
+          }
+        }
+
+        await env.DB.prepare(`
+          INSERT INTO chat_messages (id,workshop_id,conversation_id,role,content,created_at)
+          VALUES (?1,?2,?3,'assistant',?4,?5)
+        `).bind(uuid(), WORKSHOP_ID, conversation.id, reply, now()).run();
+        await env.DB.prepare(
+          "UPDATE chat_conversations SET updated_at=?1 WHERE id=?2"
+        ).bind(now(), conversation.id).run();
+        return json({ reply, limitedAi: !env.GEMINI_API_KEY });
+      }
+
+      if (url.pathname === "/api/assistant/requests" && request.method === "POST") {
+        const body = await readJson(request);
+        const publicKey = body.publicKey ? text(body.publicKey, "Clave de conversación") : null;
+        const requestType = body.requestType === "CONTACT" ? "CONTACT" : "REPAIR";
+        const name = text(body.name, "Nombre").slice(0, 120);
+        const phone = text(body.phone, "Teléfono").slice(0, 40);
+        const email = body.email ? text(body.email, "Email").slice(0, 180) : null;
+        const problem = text(body.problem, "Problema").slice(0, 2000);
+        if (body.consent !== true) return json({ error: "Se requiere consentimiento explícito para conservar la solicitud" }, 400);
+
+        let conversationId: string | null = null;
+        if (publicKey) {
+          const conversation = await env.DB.prepare(
+            "SELECT id FROM chat_conversations WHERE public_key=?1 AND workshop_id=?2"
+          ).bind(publicKey, WORKSHOP_ID).first<{ id: string }>();
+          conversationId = conversation?.id ?? null;
+        }
+        let customerId: string | null = null;
+        if (phone) {
+          const customer = await env.DB.prepare(
+            "SELECT id FROM customers WHERE workshop_id=?1 AND phone=?2 LIMIT 1"
+          ).bind(WORKSHOP_ID, phone).first<{ id: string }>();
+          customerId = customer?.id ?? null;
+          if (!customerId) {
+            const id = uuid();
+            await env.DB.prepare(`
+              INSERT INTO customers
+                (id,workshop_id,name,surname,phone,email,address,observations,status,owner_user_id,created_at,updated_at)
+              VALUES (?1,?2,?3,NULL,?4,?5,NULL,?6,'ACTIVO',NULL,?7,?8)
+            `).bind(id, WORKSHOP_ID, name, phone, email, "Creado desde solicitud de asistencia", now(), now()).run();
+            customerId = id;
+          }
+        }
+        const count = await env.DB.prepare(
+          "SELECT COUNT(*) AS count FROM service_requests WHERE workshop_id=?1"
+        ).bind(WORKSHOP_ID).first<{ count: number }>();
+        const reference = `SA-${String((count?.count ?? 0) + 1).padStart(5, "0")}`;
+        await env.DB.prepare(`
+          INSERT INTO service_requests
+            (id,workshop_id,reference,conversation_id,customer_id,name,phone,email,equipment_type,brand,model,
+             problem,accessories,request_type,status,consent_personal_data,created_at,updated_at)
+          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'NUEVA',1,?15,?16)
+        `).bind(
+          uuid(), WORKSHOP_ID, reference, conversationId, customerId, name, phone, email,
+          body.equipmentType ? text(body.equipmentType, "Tipo de equipo").slice(0, 120) : null,
+          body.brand ? text(body.brand, "Marca").slice(0, 120) : null,
+          body.model ? text(body.model, "Modelo").slice(0, 120) : null,
+          problem,
+          body.accessories ? text(body.accessories, "Accesorios").slice(0, 500) : null,
+          requestType, now(), now()
+        ).run();
+        await env.DB.prepare(
+          "UPDATE chat_conversations SET customer_id=COALESCE(customer_id,?1),name=COALESCE(name,?2),phone=COALESCE(phone,?3),email=COALESCE(email,?4),consent_chat_storage=1,updated_at=?5 WHERE id=?6"
+        ).bind(customerId, name, phone, email, now(), conversationId).run();
+        return json({ reference, status: "NUEVA", message: "Solicitud registrada. Está pendiente de revisión del taller." }, 201);
+      }
+
+      if (url.pathname === "/api/assistant/orders/track" && request.method === "POST") {
+        const body = await readJson(request);
+        const reference = text(body.reference, "Número de orden").toUpperCase();
+        const phone = text(body.phone, "Teléfono");
+        const order = await env.DB.prepare(`
+          SELECT ro.reference,ro.status,ro.received_at,ro.created_at,ro.updated_at,
+                 d.brand,d.model,
+                 qv.total_minor
+          FROM repair_orders ro
+          JOIN customers c ON c.id=ro.customer_id
+          JOIN devices d ON d.id=ro.device_id
+          LEFT JOIN quote_versions qv ON qv.id=(
+            SELECT id FROM quote_versions
+            WHERE order_id=ro.id AND workshop_id=ro.workshop_id
+            ORDER BY version DESC LIMIT 1
+          )
+          WHERE ro.workshop_id=?1 AND ro.reference=?2 AND c.phone=?3
+        `).bind(WORKSHOP_ID, reference, phone).first<{
+          reference: string; status: string; received_at: string | null; created_at: string;
+          updated_at: string; brand: string; model: string; total_minor: number | null;
+        }>();
+        if (!order) return json({ error: "No encontramos una orden con esos datos" }, 404);
+        const nextSteps: Record<string, string> = {
+          RECEIVED: "La solicitud fue recibida y está pendiente de revisión.",
+          DIAGNOSIS: "El equipo está en diagnóstico.",
+          QUOTED: "Hay un presupuesto disponible para revisión.",
+          APPROVED: "La reparación fue aprobada.",
+          WAITING_FOR_PARTS: "Estamos esperando repuestos.",
+          IN_REPAIR: "El equipo está en reparación.",
+          TESTING: "El equipo está en pruebas.",
+          READY_FOR_DELIVERY: "El equipo está listo para entrega.",
+          DELIVERED: "La reparación fue entregada.",
+          CANCELLED: "La reparación fue cancelada.",
+          NOT_REPAIRABLE: "El equipo fue marcado como no reparable."
+        };
+        return json({
+          order: {
+            reference: order.reference,
+            equipment: `${order.brand} ${order.model}`,
+            status: statusLabel(order.status),
+            receivedAt: order.received_at ?? order.created_at,
+            nextSteps: nextSteps[order.status] ?? "El taller actualizará el estado próximamente.",
+            budgetMinor: order.total_minor
+          }
+        });
+      }
+
+      if (url.pathname === "/api/assistant/knowledge" && request.method === "GET") {
+        const result = await env.DB.prepare(`
+          SELECT category,question,answer
+          FROM knowledge_base
+          WHERE workshop_id=?1 AND active=1
+          ORDER BY category,question
+        `).bind(WORKSHOP_ID).all();
+        return json({ knowledge: result.results });
+      }
+
+      if (url.pathname === "/api/admin/assistant/knowledge" && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        if (!["admin", "reception"].includes(authenticatedSession.role)) {
+          return json({ error: "Permisos insuficientes" }, 403);
+        }
+        const body = await readJson(request);
+        const id = uuid();
+        await env.DB.prepare(`
+          INSERT INTO knowledge_base
+            (id,workshop_id,category,question,answer,active,created_at,updated_at)
+          VALUES (?1,?2,?3,?4,?5,1,?6,?7)
+        `).bind(
+          id, WORKSHOP_ID,
+          text(body.category, "Categoría").slice(0, 120),
+          text(body.question, "Pregunta").slice(0, 500),
+          text(body.answer, "Respuesta").slice(0, 2000),
+          now(), now()
+        ).run();
+        return json({ id }, 201);
+      }
+
+      if (url.pathname === "/api/admin/assistant/requests" && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        const result = await env.DB.prepare(`
+          SELECT sr.*,c.name AS customer_name
+          FROM service_requests sr
+          LEFT JOIN customers c ON c.id=sr.customer_id
+          WHERE sr.workshop_id=?1
+          ORDER BY sr.created_at DESC LIMIT 500
+        `).bind(WORKSHOP_ID).all();
+        return json({ requests: result.results });
+      }
+
+      const assistantRequestStatus = url.pathname.match(/^\/api\/admin\/assistant\/requests\/([^/]+)\/status$/);
+      if (assistantRequestStatus && request.method === "PATCH") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        if (!["admin", "reception", "technical_lead"].includes(authenticatedSession.role)) {
+          return json({ error: "Permisos insuficientes" }, 403);
+        }
+        const requestId = assistantRequestStatus[1];
+        const body = await readJson(request);
+        const status = text(body.status, "Estado").toUpperCase();
+        if (!["NUEVA", "EN REVISION", "ESPERANDO CLIENTE", "DERIVADA", "RESUELTA", "CERRADA"].includes(status)) {
+          return json({ error: "Estado no válido" }, 400);
+        }
+        await env.DB.prepare(
+          "UPDATE service_requests SET status=?1,updated_at=?2 WHERE id=?3 AND workshop_id=?4"
+        ).bind(status, now(), requestId, WORKSHOP_ID).run();
+        await audit(env.DB, "service_request.status_changed", "service_request", requestId, { status });
+        return json({ status });
+      }
+
+      const assistantConvert = url.pathname.match(/^\/api\/admin\/assistant\/requests\/([^/]+)\/convert$/);
+      if (assistantConvert && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        if (!["admin", "reception", "technical_lead"].includes(authenticatedSession.role)) {
+          return json({ error: "Permisos insuficientes" }, 403);
+        }
+        const requestId = assistantConvert[1];
+        const request = await env.DB.prepare(`
+          SELECT * FROM service_requests
+          WHERE id=?1 AND workshop_id=?2
+        `).bind(requestId, WORKSHOP_ID).first<{
+          id: string; customer_id: string | null; name: string; phone: string;
+          email: string | null; equipment_type: string | null; brand: string | null;
+          model: string | null; problem: string; accessories: string | null;
+          status: string; order_id: string | null;
+        }>();
+        if (!request) return json({ error: "Solicitud no encontrada" }, 404);
+        if (request.order_id) return json({ error: "La solicitud ya fue convertida", orderId: request.order_id }, 409);
+        let customerId = request.customer_id;
+        if (!customerId) {
+          const existing = await env.DB.prepare(
+            "SELECT id FROM customers WHERE workshop_id=?1 AND phone=?2 LIMIT 1"
+          ).bind(WORKSHOP_ID, request.phone).first<{ id: string }>();
+          if (existing) {
+            customerId = existing.id;
+          } else {
+            customerId = uuid();
+            await env.DB.prepare(`
+              INSERT INTO customers
+                (id,workshop_id,name,surname,phone,email,address,observations,status,owner_user_id,created_at,updated_at)
+              VALUES (?1,?2,?3,NULL,?4,?5,NULL,?6,'ACTIVO',NULL,?7,?8)
+            `).bind(customerId, WORKSHOP_ID, request.name, request.phone, request.email, "Creado al convertir solicitud de asistencia", now(), now()).run();
+          }
+        }
+        const deviceId = uuid();
+        await env.DB.prepare(`
+          INSERT INTO devices
+            (id,workshop_id,customer_id,category,brand,model,serial_number,physical_condition,reported_fault,accessories,owner_user_id,created_at)
+          VALUES (?1,?2,?3,?4,?5,?6,NULL,NULL,?7,?8,?9,?10)
+        `).bind(
+          deviceId, WORKSHOP_ID, customerId,
+          request.equipment_type ?? "Otro",
+          request.brand ?? "Sin informar",
+          request.model ?? "Sin informar",
+          request.problem,
+          request.accessories,
+          authenticatedSession.id, now()
+        ).run();
+        const orderId = uuid();
+        const timestamp = now();
+        const count = await env.DB.prepare(
+          "SELECT COUNT(*) AS count FROM repair_orders WHERE workshop_id=?1"
+        ).bind(WORKSHOP_ID).first<{ count: number }>();
+        const reference = `GR-${String((count?.count ?? 0) + 1).padStart(5, "0")}`;
+        await env.DB.batch([
+          env.DB.prepare(`
+            INSERT INTO repair_orders
+              (id,workshop_id,customer_id,device_id,reference,reported_issue,priority,status,
+               estimated_completion_at,received_at,observations,accessories,assigned_user_id,owner_user_id,created_at,updated_at)
+            VALUES (?1,?2,?3,?4,?5,?6,'normal','RECEIVED',NULL,?7,?8,?9,NULL,?10,?11,?12)
+          `).bind(orderId, WORKSHOP_ID, customerId, deviceId, reference, request.problem, timestamp, "Creada desde solicitud de asistencia", request.accessories, authenticatedSession.id, timestamp, timestamp),
+          env.DB.prepare(`
+            INSERT INTO order_status_events
+              (id,workshop_id,order_id,from_status,to_status,actor_id,reason,created_at)
+            VALUES (?1,?2,?3,NULL,'RECEIVED',?4,'Orden creada desde solicitud aprobada',?5)
+          `).bind(uuid(), WORKSHOP_ID, orderId, authenticatedSession.id, timestamp),
+          env.DB.prepare(`
+            UPDATE service_requests
+            SET status='RESUELTA',order_id=?1,updated_at=?2
+            WHERE id=?3 AND workshop_id=?4
+          `).bind(orderId, timestamp, requestId, WORKSHOP_ID)
+        ]);
+        await audit(env.DB, "service_request.converted", "service_request", requestId, { orderId, reference });
+        return json({ orderId, reference }, 201);
       }
 
       if (url.pathname === "/api/parts" && request.method === "GET") {
