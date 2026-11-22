@@ -451,7 +451,7 @@ export default {
         const state = randomToken(24);
         const verifier = randomToken(64);
         const challenge = await sha256(verifier);
-        const redirectUri = env.GOOGLE_REDIRECT_URI ?? `${url.origin}/api/integrations/google/callback`;
+        const redirectUri = env.GOOGLE_REDIRECT_URI ?? `${url.origin}/api/auth/callback/google`;
         await env.DB.prepare(
           "INSERT INTO oauth_states (id,state,pkce_verifier_hash,pkce_verifier,user_id,service,redirect_uri,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
         ).bind(uuid(), state, challenge, verifier, authenticatedSession.id, service, redirectUri, new Date(Date.now() + 10 * 60 * 1000).toISOString(), now()).run();
@@ -470,7 +470,7 @@ export default {
         return json({ authUrl: authUrl.toString() });
       }
 
-      if (url.pathname === "/api/integrations/google/callback" && request.method === "GET") {
+      if (url.pathname === "/api/auth/callback/google" && request.method === "GET") {
         const state = url.searchParams.get("state");
         const code = url.searchParams.get("code");
         const oauthError = url.searchParams.get("error");
