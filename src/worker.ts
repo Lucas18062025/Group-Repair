@@ -1,5 +1,15 @@
 import { canTransition, type OrderStatus } from "./domain/status";
 import { calculateLineTotal } from "./domain/money";
+import {
+  clearSessionCookie,
+  decryptSecret,
+  encryptSecret,
+  parseCookie,
+  randomToken,
+  setSessionCookie,
+  sha256,
+  verifyGoogleIdToken
+} from "./auth";
 
 interface D1PreparedStatement {
   bind(...values: unknown[]): D1PreparedStatement;
@@ -21,6 +31,14 @@ interface AssetBinding {
 interface Env {
   DB: D1Database;
   ASSETS: AssetBinding;
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+  GOOGLE_REDIRECT_URI?: string;
+  GOOGLE_BOOTSTRAP_SUB?: string;
+  OAUTH_TOKEN_ENCRYPTION_KEY?: string;
+  GEMINI_API_KEY?: string;
+  GEMINI_MODEL?: string;
+  GEMINI_DAILY_LIMIT?: string;
 }
 
 const WORKSHOP_ID = "workshop-main";
@@ -80,6 +98,28 @@ async function ensureWorkshop(db: D1Database): Promise<void> {
   ).run();
 }
 
+interface SessionUser {
+  id: string;
+  workshop_id: string;
+  name: string;
+  email: string;
+  role: string;
+  status: string;
+  deactivated_at: string | null;
+}
+
+async function getSession(db: D1Database, request: Request): Promise<SessionUser | null> {
+  const token = parseCookie(request, "gr_session");
+  if (!token) return null;
+  const tokenHash = await sha256(token);
+  return db.prepare(`
+    SELECT u.id,u.workshop_id,u.name,u.email,u.role,u.status,u.deactivated_at
+    FROM auth_sessions s
+    JOIN users u ON u.id=s.user_id
+    WHERE s.token_hash=?1 AND s.revoked_at IS NULL AND s.expires_at>?2
+  `).bind(tokenHash, now()).first<SessionUser>();
+}
+
 async function audit(
   db: D1Database,
   action: string,
@@ -100,6 +140,348 @@ export default {
 
       if (url.pathname === "/api/health") {
         return json({ ok: true });
+      }
+
+      if (url.pathname === "/api/auth/config" && request.method === "GET") {
+        return json({
+          googleConfigured: Boolean(env.GOOGLE_CLIENT_ID),
+          googleClientId: env.GOOGLE_CLIENT_ID ?? null,
+          geminiConfigured: Boolean(env.GEMINI_API_KEY)
+        });
+      }
+
+      if (url.pathname === "/api/auth/nonce" && request.method === "POST") {
+        const nonce = randomToken(24);
+        await env.DB.prepare(
+          "INSERT INTO oauth_states (id,state,nonce,expires_at,created_at) VALUES (?1,?2,?3,?4,?5)"
+        ).bind(uuid(), randomToken(24), nonce, new Date(Date.now() + 10 * 60 * 1000).toISOString(), now()).run();
+        return json({ nonce });
+      }
+
+      if (url.pathname === "/api/auth/google" && request.method === "POST") {
+        if (!env.GOOGLE_CLIENT_ID) return json({ error: "Google Sign-In no está configurado" }, 503);
+        const body = await readJson(request);
+        const credential = text(body.credential, "Credencial");
+        const nonce = text(body.nonce, "Nonce");
+        const nonceRecord = await env.DB.prepare(
+          "SELECT id FROM oauth_states WHERE nonce=?1 AND used_at IS NULL AND expires_at>?2"
+        ).bind(nonce, now()).first("id");
+        if (!nonceRecord) return json({ error: "Nonce inválido o expirado" }, 401);
+        await env.DB.prepare("UPDATE oauth_states SET used_at=?1 WHERE nonce=?2").bind(now(), nonce).run();
+
+        const payload = await verifyGoogleIdToken(credential, env.GOOGLE_CLIENT_ID, nonce);
+        if (payload.email_verified !== true) return json({ error: "El correo de Google no está verificado" }, 403);
+        if (!payload.email) return json({ error: "La cuenta de Google no proporcionó correo" }, 403);
+
+        let user = await env.DB.prepare(`
+          SELECT u.id,u.workshop_id,u.name,u.email,u.role,u.status,u.deactivated_at
+          FROM google_identities g
+          JOIN users u ON u.id=g.user_id
+          WHERE g.google_sub=?1
+        `).bind(payload.sub).first<SessionUser & { workshop_id: string; deactivated_at: string | null }>();
+
+        if (!user) {
+          const userId = uuid();
+          const timestamp = now();
+          const activeAdmins = await env.DB.prepare(
+            "SELECT COUNT(*) AS count FROM users WHERE role='admin' AND status='APPROVED' AND deactivated_at IS NULL"
+          ).bind().first<number>("count");
+          const isBootstrapAdmin = Boolean(env.GOOGLE_BOOTSTRAP_SUB && env.GOOGLE_BOOTSTRAP_SUB === payload.sub && activeAdmins === 0);
+          await env.DB.prepare(
+            "INSERT INTO users (id,workshop_id,name,email,role,status,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)"
+          ).bind(
+            userId,
+            WORKSHOP_ID,
+            payload.name?.trim() || payload.email,
+            payload.email,
+            isBootstrapAdmin ? "admin" : "viewer",
+            isBootstrapAdmin ? "APPROVED" : "PENDING",
+            timestamp
+          ).run();
+          await env.DB.prepare(
+            "INSERT INTO google_identities (id,user_id,google_sub,email,email_verified,created_at) VALUES (?1,?2,?3,?4,?5,?6)"
+          ).bind(uuid(), userId, payload.sub, payload.email, payload.email_verified ? 1 : 0, timestamp).run();
+          user = await env.DB.prepare(
+            "SELECT id,workshop_id,name,email,role,status,deactivated_at FROM users WHERE id=?1"
+          ).bind(userId).first<SessionUser & { deactivated_at: string | null }>();
+          if (!user) return json({ error: "No se pudo crear la cuenta" }, 500);
+        } else {
+          await env.DB.prepare(
+            "INSERT OR IGNORE INTO google_identities (id,user_id,google_sub,email,email_verified,created_at) VALUES (?1,?2,?3,?4,?5,?6)"
+          ).bind(uuid(), user.id, payload.sub, payload.email, payload.email_verified ? 1 : 0, now()).run();
+        }
+
+        if (user.deactivated_at || user.status === "DEACTIVATED") {
+          return json({ error: "La cuenta está desactivada" }, 403);
+        }
+        await env.DB.prepare("UPDATE users SET last_login_at=?1 WHERE id=?2").bind(now(), user.id).run();
+
+        const sessionToken = randomToken(32);
+        const tokenHash = await sha256(sessionToken);
+        await env.DB.prepare(
+          "INSERT INTO auth_sessions (id,user_id,token_hash,expires_at,created_at,ip_hash,user_agent) VALUES (?1,?2,?3,?4,?5,?6,?7)"
+        ).bind(
+          uuid(),
+          user.id,
+          tokenHash,
+          new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString(),
+          now(),
+          null,
+          request.headers.get("user-agent")?.slice(0, 240) ?? null
+        ).run();
+
+        return new Response(JSON.stringify({
+          user: { id: user.id, name: user.name, email: user.email, role: user.role, status: user.status }
+        }), {
+          status: 200,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "set-cookie": setSessionCookie(sessionToken)
+          }
+        });
+      }
+
+      if (url.pathname === "/api/auth/me" && request.method === "GET") {
+        const session = await getSession(env.DB, request);
+        if (!session) return json({ user: null });
+        return json({ user: { id: session.id, name: session.name, email: session.email, role: session.role, status: session.status } });
+      }
+
+      if (url.pathname === "/api/auth/logout" && request.method === "POST") {
+        const token = parseCookie(request, "gr_session");
+        if (token) {
+          await env.DB.prepare("UPDATE auth_sessions SET revoked_at=?1 WHERE token_hash=?2").bind(now(), await sha256(token)).run();
+        }
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json; charset=utf-8", "set-cookie": clearSessionCookie() }
+        });
+      }
+
+      const session = await getSession(env.DB, request);
+      if (url.pathname.startsWith("/api/")) {
+        if (!session) return json({ error: "Autenticación requerida" }, 401);
+        if (session.status !== "APPROVED" || session.deactivated_at) {
+          return json({ error: "Cuenta pendiente de aprobación o desactivada" }, 403);
+        }
+      }
+      const authenticatedSession = session as SessionUser;
+
+      if (url.pathname === "/api/auth/logout-all" && request.method === "POST") {
+        await env.DB.prepare("UPDATE auth_sessions SET revoked_at=?1 WHERE user_id=?2 AND revoked_at IS NULL").bind(now(), authenticatedSession.id).run();
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json; charset=utf-8", "set-cookie": clearSessionCookie() }
+        });
+      }
+
+      if (url.pathname === "/api/admin/users" && request.method === "GET") {
+        if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
+        const users = await env.DB.prepare(
+          "SELECT id,workshop_id,name,email,role,status,deactivated_at,created_at,last_login_at FROM users WHERE workshop_id=?1 ORDER BY created_at DESC"
+        ).bind(WORKSHOP_ID).all();
+        return json({ users: users.results });
+      }
+
+      const approvalMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/(approve|deactivate)$/);
+      if (approvalMatch && request.method === "POST") {
+        if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
+        const userId = approvalMatch[1];
+        const action = approvalMatch[2];
+        if (userId === authenticatedSession.id) return json({ error: "No puedes cambiar tu propia cuenta desde esta operación" }, 409);
+        if (action === "approve") {
+          await env.DB.prepare("UPDATE users SET status='APPROVED',deactivated_at=NULL WHERE id=?1 AND workshop_id=?2").bind(userId, WORKSHOP_ID).run();
+        } else {
+          await env.DB.prepare("UPDATE users SET status='DEACTIVATED',deactivated_at=?1 WHERE id=?2 AND workshop_id=?3").bind(now(), userId, WORKSHOP_ID).run();
+        }
+        await audit(env.DB, `user.${action}`, "user", userId);
+        return json({ ok: true });
+      }
+
+      if (url.pathname === "/api/integrations" && request.method === "GET") {
+        const connections = await env.DB.prepare(
+          "SELECT service,account_email,status,scopes,expires_at,connected_at,last_sync_at,error,updated_at FROM google_connections WHERE user_id=?1"
+        ).bind(authenticatedSession.id).all();
+        return json({ connections: connections.results });
+      }
+
+      const integrationStart = url.pathname.match(/^\/api\/integrations\/(google_drive|google_sheets|google_photos)\/start$/);
+      if (integrationStart && request.method === "POST") {
+        const service = integrationStart[1];
+        if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
+          return json({ error: "Google OAuth no está configurado. Pendiente de credenciales externas." }, 503);
+        }
+        const scopes: Record<string, string[]> = {
+          google_drive: ["https://www.googleapis.com/auth/drive.file"],
+          google_sheets: ["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/spreadsheets"],
+          google_photos: ["https://www.googleapis.com/auth/photospicker.mediaitems.readonly"]
+        };
+        const state = randomToken(24);
+        const verifier = randomToken(64);
+        const challenge = await sha256(verifier);
+        const redirectUri = env.GOOGLE_REDIRECT_URI ?? `${url.origin}/api/integrations/google/callback`;
+        await env.DB.prepare(
+          "INSERT INTO oauth_states (id,state,pkce_verifier_hash,pkce_verifier,user_id,service,redirect_uri,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
+        ).bind(uuid(), state, challenge, verifier, authenticatedSession.id, service, redirectUri, new Date(Date.now() + 10 * 60 * 1000).toISOString(), now()).run();
+
+        const authUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+        authUrl.searchParams.set("client_id", env.GOOGLE_CLIENT_ID);
+        authUrl.searchParams.set("redirect_uri", redirectUri);
+        authUrl.searchParams.set("response_type", "code");
+        authUrl.searchParams.set("scope", scopes[service].join(" "));
+        authUrl.searchParams.set("include_granted_scopes", "true");
+        authUrl.searchParams.set("access_type", "offline");
+        authUrl.searchParams.set("prompt", "consent");
+        authUrl.searchParams.set("state", state);
+        authUrl.searchParams.set("code_challenge", challenge);
+        authUrl.searchParams.set("code_challenge_method", "S256");
+        return json({ authUrl: authUrl.toString() });
+      }
+
+      if (url.pathname === "/api/integrations/google/callback" && request.method === "GET") {
+        const state = url.searchParams.get("state");
+        const code = url.searchParams.get("code");
+        const oauthError = url.searchParams.get("error");
+        if (oauthError) return new Response(null, { status: 302, headers: { location: "/?integration_error=google&tab=integraciones" } });
+        if (!state || !code) return json({ error: "Respuesta OAuth incompleta" }, 400);
+        const record = await env.DB.prepare(`
+          SELECT state,user_id,service,redirect_uri,pkce_verifier,expires_at,used_at
+          FROM oauth_states WHERE state=?1
+        `).bind(state).first<{ state: string; user_id: string; service: string; redirect_uri: string; pkce_verifier: string; expires_at: string; used_at: string | null }>();
+        if (!record || record.used_at || record.expires_at <= now() || record.user_id !== authenticatedSession.id) {
+          return json({ error: "Estado OAuth inválido o expirado" }, 401);
+        }
+        if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
+          return json({ error: "Google OAuth no está configurado" }, 503);
+        }
+        await env.DB.prepare("UPDATE oauth_states SET used_at=?1 WHERE state=?2").bind(now(), state).run();
+
+        const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            code,
+            client_id: env.GOOGLE_CLIENT_ID,
+            client_secret: env.GOOGLE_CLIENT_SECRET,
+            redirect_uri: record.redirect_uri,
+            grant_type: "authorization_code",
+            code_verifier: record.pkce_verifier
+          })
+        });
+        const tokenBody = await tokenResponse.json() as {
+          access_token?: string;
+          refresh_token?: string;
+          expires_in?: number;
+          scope?: string;
+          error?: string;
+        };
+        if (!tokenResponse.ok || !tokenBody.access_token) {
+          return json({ error: tokenBody.error ?? "No se pudieron intercambiar las credenciales" }, 502);
+        }
+        if (!env.OAUTH_TOKEN_ENCRYPTION_KEY) {
+          return json({ error: "Falta la clave de cifrado de tokens OAuth" }, 503);
+        }
+        const accessEncrypted = await encryptSecret(tokenBody.access_token, env.OAUTH_TOKEN_ENCRYPTION_KEY);
+        const refreshEncrypted = tokenBody.refresh_token
+          ? await encryptSecret(tokenBody.refresh_token, env.OAUTH_TOKEN_ENCRYPTION_KEY)
+          : null;
+        const expiresAt = new Date(Date.now() + (tokenBody.expires_in ?? 3600) * 1000).toISOString();
+        await env.DB.prepare(`
+          INSERT INTO google_connections (id,user_id,service,status,access_token_encrypted,refresh_token_encrypted,scopes,expires_at,connected_at,created_at,updated_at)
+          VALUES (?1,?2,?3,'connected',?4,?5,?6,?7,?8,?9,?10)
+          ON CONFLICT(user_id,service) DO UPDATE SET
+            status='connected',access_token_encrypted=excluded.access_token_encrypted,
+            refresh_token_encrypted=COALESCE(excluded.refresh_token_encrypted,google_connections.refresh_token_encrypted),
+            scopes=excluded.scopes,expires_at=excluded.expires_at,connected_at=excluded.connected_at,
+            error=NULL,updated_at=excluded.updated_at
+        `).bind(
+          uuid(), authenticatedSession.id, record.service, accessEncrypted, refreshEncrypted,
+          tokenBody.scope ?? null, expiresAt, now(), now(), now()
+        ).run();
+        await audit(env.DB, "integration.connected", "integration", authenticatedSession.id, { service: record.service });
+        return new Response(null, { status: 302, headers: { location: `/?tab=integraciones&connected=${encodeURIComponent(record.service)}` } });
+      }
+
+      const integrationDisconnect = url.pathname.match(/^\/api\/integrations\/(google_drive|google_sheets|google_photos)\/disconnect$/);
+      if (integrationDisconnect && request.method === "POST") {
+        const service = integrationDisconnect[1];
+        await env.DB.prepare(
+          "UPDATE google_connections SET status='disconnected',access_token_encrypted=NULL,refresh_token_encrypted=NULL,error=NULL,updated_at=?1 WHERE user_id=?2 AND service=?3"
+        ).bind(now(), authenticatedSession.id, service).run();
+        await audit(env.DB, "integration.disconnected", "integration", authenticatedSession.id, { service });
+        return json({ ok: true });
+      }
+
+      if (url.pathname === "/api/gemini/chat" && request.method === "POST") {
+        if (!env.GEMINI_API_KEY) {
+          return json({ error: "Gemini no está configurado. La integración está pendiente." }, 503);
+        }
+        const body = await readJson(request);
+        const prompt = text(body.prompt, "Consulta").slice(0, 4000);
+        const dailyLimit = Math.max(1, Number(env.GEMINI_DAILY_LIMIT ?? "20"));
+        const today = new Date();
+        today.setUTCHours(0, 0, 0, 0);
+        const usage = await env.DB.prepare(`
+          SELECT COUNT(*) AS count FROM gemini_usage
+          WHERE user_id=?1 AND created_at>=?2
+        `).bind(authenticatedSession.id, today.toISOString()).first<number>("count");
+        if ((usage ?? 0) >= dailyLimit) {
+          return json({ error: "Se alcanzó el límite diario de consultas" }, 429);
+        }
+
+        const model = env.GEMINI_MODEL ?? "gemini-2.5-flash";
+        const started = Date.now();
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 30000);
+        let geminiResponse: Response;
+        try {
+          geminiResponse = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+            {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "x-goog-api-key": env.GEMINI_API_KEY
+              },
+              body: JSON.stringify({
+                systemInstruction: {
+                  parts: [{
+                    text: "Eres Group Repair Intelligence. Actúa como asistente técnico, no como autoridad definitiva. Diferencia hechos, hipótesis y recomendaciones. No inventes diagnósticos ni confirmes reparaciones no verificadas. No sugieras ejecutar cambios automáticos."
+                  }]
+                },
+                contents: [{ role: "user", parts: [{ text: prompt }] }],
+                generationConfig: { temperature: 0.2, maxOutputTokens: 800 }
+              }),
+              signal: controller.signal
+            }
+          );
+        } finally {
+          clearTimeout(timeout);
+        }
+        const responseBody = await geminiResponse.json() as {
+          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+          error?: { message?: string; code?: number };
+        };
+        if (!geminiResponse.ok) {
+          await env.DB.prepare(
+            "INSERT INTO gemini_usage (id,user_id,model,input_chars,output_chars,latency_ms,success,error_code,created_at) VALUES (?1,?2,?3,?4,0,?5,0,?6,?7)"
+          ).bind(uuid(), authenticatedSession.id, model, prompt.length, Date.now() - started, String(responseBody.error?.code ?? "gemini_error"), now()).run();
+          return json({ error: "Gemini no pudo procesar la consulta" }, 502);
+        }
+        const answer = responseBody.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("\n").trim();
+        if (!answer) return json({ error: "Gemini devolvió una respuesta vacía" }, 502);
+        await env.DB.batch([
+          env.DB.prepare(
+            "INSERT INTO gemini_usage (id,user_id,model,input_chars,output_chars,latency_ms,success,error_code,created_at) VALUES (?1,?2,?3,?4,?5,?6,1,NULL,?7)"
+          ).bind(uuid(), authenticatedSession.id, model, prompt.length, answer.length, Date.now() - started, now()),
+          env.DB.prepare(
+            "INSERT INTO gemini_history (id,user_id,role,content_preview,created_at) VALUES (?1,?2,'user',?3,?4)"
+          ).bind(uuid(), authenticatedSession.id, prompt.slice(0, 240), now()),
+          env.DB.prepare(
+            "INSERT INTO gemini_history (id,user_id,role,content_preview,created_at) VALUES (?1,?2,'assistant',?3,?4)"
+          ).bind(uuid(), authenticatedSession.id, answer.slice(0, 240), now())
+        ]);
+        return json({ answer, model, disclaimer: "Asistente técnico: confirmar diagnósticos y operaciones con criterio humano." });
       }
 
       if (url.pathname === "/api/dashboard" && request.method === "GET") {

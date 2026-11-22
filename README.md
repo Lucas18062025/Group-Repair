@@ -39,6 +39,26 @@ El repositorio comienza con documentación de producto. La arquitectura, stack, 
 
 Los datos operativos se guardan en Cloudflare D1, vinculada al Worker mediante `DB`. Las migraciones versionadas están en `migrations/` y el entorno local usa una copia SQLite gestionada por Wrangler. No se almacenan datos personales reales ni datos de tarjetas en el repositorio.
 
+## Google y Gemini
+
+La arquitectura de autenticación y las conexiones OAuth están implementadas, pero las integraciones reales permanecen desactivadas hasta configurar credenciales externas:
+
+- Google Cloud: OAuth 2.0 Web Client ID, Client Secret, consent screen, redirect URI `https://group-repair.lucaslean1806.workers.dev/api/integrations/google/callback` y APIs habilitadas.
+- Google Identity: configurar `GOOGLE_CLIENT_ID` y el `GOOGLE_BOOTSTRAP_SUB` del primer administrador.
+- OAuth: configurar `OAUTH_TOKEN_ENCRYPTION_KEY` con una clave aleatoria de 32 bytes.
+- Gemini: configurar `GEMINI_API_KEY`, opcionalmente `GEMINI_MODEL` y `GEMINI_DAILY_LIMIT`.
+- Google Sheets necesita permisos de hojas y Drive; Drive y Sheets priorizan scopes limitados a archivos creados o seleccionados.
+- Google Photos usa Photos Picker y no solicita acceso indiscriminado a toda la biblioteca.
+
+Ejemplo de secretos sin valores reales:
+
+```powershell
+npx wrangler secret put GOOGLE_CLIENT_SECRET
+npx wrangler secret put GOOGLE_BOOTSTRAP_SUB
+npx wrangler secret put OAUTH_TOKEN_ENCRYPTION_KEY
+npx wrangler secret put GEMINI_API_KEY
+```
+
 ## Desarrollo
 
 A partir de este estado, el repositorio incluye una aplicación inicial con React, TypeScript, Vite, Cloudflare Workers y Cloudflare D1.
