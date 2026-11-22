@@ -35,6 +35,10 @@ El repositorio comienza con documentación de producto. La arquitectura, stack, 
 - Domingo: cerrado.
 - Consultas de garantía: `+54 9 381 524-9553`.
 
+## Persistencia
+
+Los datos operativos se guardan en Cloudflare D1, vinculada al Worker mediante `DB`. Las migraciones versionadas están en `migrations/` y el entorno local usa una copia SQLite gestionada por Wrangler. No se almacenan datos personales reales ni datos de tarjetas en el repositorio.
+
 ## Desarrollo
 
 A partir de este estado, el repositorio incluye una aplicación inicial con React, TypeScript, Vite, Cloudflare Workers y Cloudflare D1.

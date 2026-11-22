@@ -110,7 +110,8 @@ export default function App() {
 
   async function submitCustomer(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     setBusy(true);
     try {
       await api("/api/customers", {
@@ -122,7 +123,7 @@ export default function App() {
           address: form.get("address")
         })
       });
-      event.currentTarget.reset();
+      formElement.reset();
       setMessage("Cliente registrado");
       await refresh();
     } catch (error) {
@@ -133,7 +134,8 @@ export default function App() {
 
   async function submitPart(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     setBusy(true);
     try {
       await api("/api/parts", {
@@ -147,7 +149,7 @@ export default function App() {
           minimumStock: Number(form.get("minimum"))
         })
       });
-      event.currentTarget.reset();
+      formElement.reset();
       setMessage("Repuesto registrado");
       await refresh();
     } catch (error) {
@@ -158,7 +160,8 @@ export default function App() {
 
   async function submitOrder(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     setBusy(true);
     try {
       const device = await api<{ id: string }>("/api/devices", {
@@ -184,7 +187,7 @@ export default function App() {
           estimatedCompletionAt: form.get("estimated")
         })
       });
-      event.currentTarget.reset();
+      formElement.reset();
       setMessage(`Orden ${created.reference} creada`);
       await refresh();
     } catch (error) {
@@ -197,7 +200,7 @@ export default function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark">GR</span>
+          <img className="brand-mark" src="/Group-Repair.jpg" alt="Logo de Group Repair" />
           <div><strong>Group Repair</strong><small>Taller técnico</small></div>
         </div>
         <nav aria-label="Navegación principal">
@@ -239,6 +242,11 @@ export default function App() {
               <article className="panel-card">
                 <h2>Alertas de inventario</h2>
                 {dashboard?.lowStock.length ? dashboard.lowStock.map(part => <div className="stock-alert" key={part.id}><span>{part.name}</span><strong>{part.stock} mín. {part.minimum_stock}</strong></div>) : <p className="empty">No hay alertas de stock.</p>}
+              </article>
+              <article className="panel-card storage-card">
+                <h2>Persistencia de datos</h2>
+                <p><strong>Cloudflare D1</strong></p>
+                <p className="empty">Clientes, equipos, órdenes, diagnósticos, presupuestos, pagos e inventario se guardan en la base remota configurada para este Worker.</p>
               </article>
             </div>
           </section>
