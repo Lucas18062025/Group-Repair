@@ -20,35 +20,6 @@ La aplicación incluye un panel operativo y secciones para clientes, equipos, ó
 El acceso al panel y a las operaciones generales de negocio está habilitado sin login obligatorio. Las funciones administrativas, la gestión de cuentas Google autorizadas y las credenciales OAuth permanecen protegidas por sesión aprobada.
 
 Mientras el modo público esté activo, terceros pueden utilizar las operaciones generales disponibles desde la aplicación. No se debe usar con datos reales de clientes hasta que se habilite la separación multiusuario y se revisen los permisos del taller. Los secretos de Google, Gemini y Cloudflare no se exponen al frontend.
-
-## Desarrollo local
-
-### Requisitos
-
-- Node.js 22 o compatible.
-- npm.
-- Wrangler y acceso a Cloudflare D1 para tareas que requieran la base de datos remota o el despliegue.
-
-### Instalación y comandos
-
-```bash
-npm install
-npm run cf:types
-npm run cf:migrate
-npm run dev
-```
-
-Verificaciones y compilación:
-
-```bash
-npm test
-npm run typecheck
-npm run build
-npx wrangler deploy --dry-run
-```
-
-La configuración de Cloudflare se encuentra en [`wrangler.jsonc`](wrangler.jsonc) y las migraciones versionadas en [`migrations/`](migrations/). Revisá la configuración del entorno antes de aplicar migraciones o desplegar; no incluyas secretos ni datos reales en el repositorio.
-
 ## Despliegue (Cloudflare)
 
 La aplicación está desplegada en Cloudflare Workers: [https://group-repair.lucaslean1806.workers.dev/](https://group-repair.lucaslean1806.workers.dev/).
