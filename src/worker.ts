@@ -233,6 +233,22 @@ export default {
           ).bind(uuid(), user.id, payload.sub, payload.email, payload.email_verified ? 1 : 0, now()).run();
         }
 
+        const activeAdmins = await env.DB.prepare(
+          "SELECT COUNT(*) AS count FROM users WHERE role='admin' AND status='APPROVED' AND deactivated_at IS NULL"
+        ).bind().first<number>("count");
+        if (
+          activeAdmins === 0 &&
+          env.GOOGLE_BOOTSTRAP_SUB &&
+          env.GOOGLE_BOOTSTRAP_SUB === payload.sub
+        ) {
+          await env.DB.prepare(
+            "UPDATE users SET role='admin',status='APPROVED',deactivated_at=NULL WHERE id=?1"
+          ).bind(user.id).run();
+          user.role = "admin";
+          user.status = "APPROVED";
+          user.deactivated_at = null;
+        }
+
         if (user.deactivated_at || user.status === "DEACTIVATED") {
           return json({ error: "La cuenta está desactivada" }, 403);
         }
