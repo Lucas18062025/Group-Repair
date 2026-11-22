@@ -138,6 +138,14 @@ export default {
       await ensureWorkshop(env.DB);
       const url = new URL(request.url);
 
+      if (url.pathname === "/privacy" || url.pathname === "/privacy-policy") {
+        return env.ASSETS.fetch(new Request(new URL("/privacy.html", url.origin).toString()));
+      }
+
+      if (url.pathname === "/terms" || url.pathname === "/terms-of-service") {
+        return env.ASSETS.fetch(new Request(new URL("/terms.html", url.origin).toString()));
+      }
+
       if (url.pathname === "/api/health") {
         return json({ ok: true });
       }
@@ -238,12 +246,16 @@ export default {
           const activeAdmins = await env.DB.prepare(
             "SELECT COUNT(*) AS count FROM users WHERE role='admin' AND status='APPROVED' AND deactivated_at IS NULL"
           ).bind().first<number>("count");
+          const isExistingAdmin =
+            user.role === "admin" &&
+            user.status === "APPROVED" &&
+            !user.deactivated_at;
           const isBootstrapAdmin = Boolean(
             activeAdmins === 0 &&
             env.GOOGLE_BOOTSTRAP_SUB &&
             env.GOOGLE_BOOTSTRAP_SUB === payload.sub
           );
-          if (!allowlistEntry && !isBootstrapAdmin) {
+          if (!allowlistEntry && !isBootstrapAdmin && !isExistingAdmin) {
             return json({ error: "Cuenta no autorizada" }, 403);
           }
           if (allowlistEntry && user.status === "PENDING") {

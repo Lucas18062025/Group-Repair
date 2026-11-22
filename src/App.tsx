@@ -506,6 +506,11 @@ export default function App() {
             <div className="notice">Google Sign-In pendiente de configuración externa.</div>
           )}
           {message && <div className="notice login-error" role="alert">{message}</div>}
+          <small className="auth-links">
+            <a href="/privacy" target="_blank" rel="noreferrer">Privacidad</a>
+            <span> · </span>
+            <a href="/terms" target="_blank" rel="noreferrer">Términos</a>
+          </small>
         </main>
       </div>
     ) : authUser.status !== "APPROVED" ? (

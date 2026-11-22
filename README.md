@@ -10,6 +10,8 @@ Group Repair es una aplicación web para gestionar las operaciones de un taller 
 - **Stack:** React, TypeScript, Vite, Cloudflare Workers y Cloudflare D1.
 - **Persistencia:** Cloudflare D1, vinculada al Worker mediante `DB`.
 - **Especificación del producto:** [`SPEC.md`](SPEC.md).
+- **Privacidad:** [Política de privacidad](https://group-repair.lucaslean1806.workers.dev/privacy)
+- **Términos:** [Términos de servicio](https://group-repair.lucaslean1806.workers.dev/terms)
 
 La aplicación incluye un panel operativo y secciones para clientes, equipos, órdenes e inventario. El Worker expone operaciones de API para la gestión del taller, con validaciones de dominio, registro de eventos y persistencia en D1. La disponibilidad de servicios externos —por ejemplo, Google o Gemini— depende de la configuración de credenciales y APIs correspondientes.
 
