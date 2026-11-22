@@ -170,6 +170,14 @@ export default function App() {
   useEffect(() => {
     void (async () => {
       try {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get("integration_error") === "google") {
+          setMessage("Google denegó la autorización. En modo Testing, agrega la cuenta como Test User o publica/verifica el proyecto.");
+          window.history.replaceState({}, "", window.location.pathname);
+        } else if (params.get("connected")) {
+          setMessage(`Integración ${params.get("connected")} conectada`);
+          window.history.replaceState({}, "", window.location.pathname);
+        }
         const [config, me] = await Promise.all([
           api<AuthConfig>("/api/auth/config"),
           api<AuthMe>("/api/auth/me")
@@ -191,51 +199,70 @@ export default function App() {
   useEffect(() => {
     if (!authConfig?.googleConfigured || !authConfig.googleClientId) return;
     const existing = document.querySelector<HTMLScriptElement>('script[src="https://accounts.google.com/gsi/client"]');
+    let cancelled = false;
+    let timeoutId: number | undefined;
     const initialize = async () => {
-      const nonceResponse = await api<{ nonce: string }>("/api/auth/nonce", { method: "POST" });
-      window.google?.accounts?.id?.initialize({
-        client_id: authConfig.googleClientId!,
-        nonce: nonceResponse.nonce,
-        callback: async (response) => {
-          setBusy(true);
-          try {
-            const result = await api<{ user: AuthUser; googleSub: string }>("/api/auth/google", {
-              method: "POST",
-              body: JSON.stringify({ credential: response.credential, nonce: nonceResponse.nonce })
-            });
-            setAuthUser(result.user);
-            setGoogleSub(result.googleSub);
-            setMessage(result.user.status === "APPROVED" ? "Sesión iniciada" : "Cuenta creada. Pendiente de aprobación.");
-            if (result.user.status === "APPROVED") await refresh();
-          } catch (error) {
-            setMessage(error instanceof Error ? error.message : "No se pudo iniciar sesión");
-          } finally {
-            setBusy(false);
-          }
+      try {
+        if (!window.google?.accounts?.id) {
+          throw new Error("Google Identity Services aún no está disponible");
         }
-      });
-      const button = document.getElementById("google-signin-button");
-      if (button) {
-        window.google?.accounts?.id?.renderButton(button, {
-          type: "standard",
-          theme: "outline",
-          size: "large",
-          text: "continue_with",
-          shape: "rectangular",
-          width: 280,
-          locale: "es"
+        const nonceResponse = await api<{ nonce: string }>("/api/auth/nonce", { method: "POST" });
+        if (cancelled) return;
+        window.google.accounts.id.initialize({
+          client_id: authConfig.googleClientId!,
+          nonce: nonceResponse.nonce,
+          callback: async (response) => {
+            setBusy(true);
+            try {
+              const result = await api<{ user: AuthUser; googleSub: string }>("/api/auth/google", {
+                method: "POST",
+                body: JSON.stringify({ credential: response.credential, nonce: nonceResponse.nonce })
+              });
+              setAuthUser(result.user);
+              setGoogleSub(result.googleSub);
+              setMessage(result.user.status === "APPROVED" ? "Sesión iniciada" : "Cuenta creada. Pendiente de aprobación.");
+              if (result.user.status === "APPROVED") await refresh();
+            } catch (error) {
+              setMessage(error instanceof Error ? error.message : "No se pudo iniciar sesión");
+            } finally {
+              setBusy(false);
+            }
+          }
         });
+        const button = document.getElementById("google-signin-button");
+        if (button) {
+          window.google.accounts.id.renderButton(button, {
+            type: "standard",
+            theme: "outline",
+            size: "large",
+            text: "continue_with",
+            shape: "rectangular",
+            width: 280,
+            locale: "es"
+          });
+        }
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : "No se pudo preparar Google Sign-In");
       }
     };
-    if (existing) {
-      void initialize();
+    if (window.google?.accounts?.id) {
+      timeoutId = window.setTimeout(() => { void initialize(); }, 0);
+    } else if (existing) {
+      existing.addEventListener("load", () => { void initialize(); }, { once: true });
+      existing.addEventListener("error", () => setMessage("No se pudo cargar Google Sign-In"), { once: true });
+      timeoutId = window.setTimeout(() => setMessage("Google Sign-In tardó demasiado en cargar"), 10000);
     } else {
       const script = document.createElement("script");
       script.src = "https://accounts.google.com/gsi/client";
       script.async = true;
       script.onload = () => { void initialize(); };
+      script.onerror = () => setMessage("No se pudo cargar Google Sign-In");
       document.head.appendChild(script);
     }
+    return () => {
+      cancelled = true;
+      if (timeoutId) window.clearTimeout(timeoutId);
+    };
   }, [authConfig]);
 
   async function loadIntegrations() {

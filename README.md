@@ -50,6 +50,19 @@ La arquitectura de autenticación y las conexiones OAuth están implementadas, p
 - Google Sheets necesita permisos de hojas y Drive; Drive y Sheets priorizan scopes limitados a archivos creados o seleccionados.
 - Google Photos usa Photos Picker y no solicita acceso indiscriminado a toda la biblioteca.
 
+### Estado Testing y cuentas externas
+
+Mientras el Consent Screen de Google esté en **Testing**, solo pueden autorizarse las cuentas agregadas en:
+
+`Google Cloud Console > APIs y servicios > Pantalla de consentimiento de OAuth > Usuarios de prueba`
+
+Agregar como usuario de prueba cada cuenta Google habilitada. Para usuarios externos sin verificación limitada:
+
+1. Completar Branding, dominios autorizados, soporte, privacidad y términos.
+2. Habilitar las APIs reales utilizadas.
+3. Publicar la aplicación o iniciar el proceso de verificación de Google.
+4. Mantener el acceso pendiente hasta aprobar/verificar las cuentas correspondientes.
+
 Ejemplo de secretos sin valores reales:
 
 ```powershell
