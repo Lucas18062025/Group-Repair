@@ -96,6 +96,11 @@ async function ensureWorkshop(db: D1Database): Promise<void> {
     "domingo",
     WORKSHOP_ID
   ).run();
+  await db.prepare(`
+    INSERT OR IGNORE INTO users
+      (id,workshop_id,name,email,role,status,created_at)
+    VALUES ('public-visitor',?1,'Visitante público','public@group-repair.local','viewer','APPROVED',?2)
+  `).bind(WORKSHOP_ID, now()).run();
 }
 
 interface SessionUser {
@@ -344,14 +349,16 @@ export default {
 
       const session = await getSession(env.DB, request);
       if (url.pathname.startsWith("/api/")) {
-        if (!session) return json({ error: "Autenticación requerida" }, 401);
-        if (session.status !== "APPROVED" || session.deactivated_at) {
-          return json({ error: "Cuenta pendiente de aprobación o desactivada" }, 403);
-        }
+        // Public business operations are intentionally available while authentication
+        // is disabled. Administrative and credential-bearing operations remain guarded below.
       }
-      const authenticatedSession = session as SessionUser;
+      const authenticatedSession =
+        session && session.status === "APPROVED" && !session.deactivated_at
+          ? session
+          : null;
 
       if (url.pathname === "/api/auth/logout-all" && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         await env.DB.prepare("UPDATE auth_sessions SET revoked_at=?1 WHERE user_id=?2 AND revoked_at IS NULL").bind(now(), authenticatedSession.id).run();
         return new Response(JSON.stringify({ ok: true }), {
           status: 200,
@@ -360,6 +367,7 @@ export default {
       }
 
       if (url.pathname === "/api/admin/users" && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
         const users = await env.DB.prepare(
           "SELECT id,workshop_id,name,email,role,status,deactivated_at,created_at,last_login_at FROM users WHERE workshop_id=?1 ORDER BY created_at DESC"
@@ -369,6 +377,7 @@ export default {
 
       const approvalMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/(approve|deactivate)$/);
       if (approvalMatch && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
         const userId = approvalMatch[1];
         const action = approvalMatch[2];
@@ -384,6 +393,7 @@ export default {
 
       const roleMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/role$/);
       if (roleMatch && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
         const userId = roleMatch[1];
         if (userId === authenticatedSession.id) return json({ error: "No puedes cambiar tu propio rol" }, 409);
@@ -399,6 +409,7 @@ export default {
       }
 
       if (url.pathname === "/api/admin/google-accounts" && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
         const accounts = await env.DB.prepare(
           "SELECT id,email,google_sub,status,created_at,updated_at FROM google_access_allowlist WHERE workshop_id=?1 ORDER BY created_at DESC"
@@ -407,6 +418,7 @@ export default {
       }
 
       if (url.pathname === "/api/admin/google-accounts" && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
         const body = await readJson(request);
         const email = text(body.email, "Email").toLowerCase();
@@ -425,6 +437,7 @@ export default {
 
       const allowlistDelete = url.pathname.match(/^\/api\/admin\/google-accounts\/([^/]+)$/);
       if (allowlistDelete && request.method === "DELETE") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
         const accountId = allowlistDelete[1];
         const account = await env.DB.prepare(
@@ -454,6 +467,7 @@ export default {
       }
 
       if (url.pathname === "/api/integrations" && request.method === "GET") {
+        if (!authenticatedSession) return json({ connections: [] });
         const connections = await env.DB.prepare(
           "SELECT service,account_email,status,scopes,expires_at,connected_at,last_sync_at,error,updated_at FROM google_connections WHERE user_id=?1"
         ).bind(authenticatedSession.id).all();
@@ -462,6 +476,7 @@ export default {
 
       const integrationStart = url.pathname.match(/^\/api\/integrations\/(google_drive|google_sheets|google_photos)\/start$/);
       if (integrationStart && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Iniciá sesión con Google para autorizar esta integración" }, 401);
         const service = integrationStart[1];
         if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
           return json({ error: "Google OAuth no está configurado. Pendiente de credenciales externas." }, 503);
@@ -494,6 +509,9 @@ export default {
       }
 
       if (url.pathname === "/api/auth/callback/google" && request.method === "GET") {
+        if (!authenticatedSession) {
+          return new Response(null, { status: 302, headers: { location: "/?tab=integraciones&integration_error=auth_required" } });
+        }
         const state = url.searchParams.get("state");
         const code = url.searchParams.get("code");
         const oauthError = url.searchParams.get("error");
@@ -559,6 +577,7 @@ export default {
 
       const integrationDisconnect = url.pathname.match(/^\/api\/integrations\/(google_drive|google_sheets|google_photos)\/disconnect$/);
       if (integrationDisconnect && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Iniciá sesión con Google para administrar esta integración" }, 401);
         const service = integrationDisconnect[1];
         await env.DB.prepare(
           "UPDATE google_connections SET status='disconnected',access_token_encrypted=NULL,refresh_token_encrypted=NULL,error=NULL,updated_at=?1 WHERE user_id=?2 AND service=?3"
@@ -573,13 +592,14 @@ export default {
         }
         const body = await readJson(request);
         const prompt = text(body.prompt, "Consulta").slice(0, 4000);
+        const chatUserId = authenticatedSession?.id ?? "public-visitor";
         const dailyLimit = Math.max(1, Number(env.GEMINI_DAILY_LIMIT ?? "20"));
         const today = new Date();
         today.setUTCHours(0, 0, 0, 0);
         const usage = await env.DB.prepare(`
           SELECT COUNT(*) AS count FROM gemini_usage
           WHERE user_id=?1 AND created_at>=?2
-        `).bind(authenticatedSession.id, today.toISOString()).first<number>("count");
+        `).bind(chatUserId, today.toISOString()).first<number>("count");
         if ((usage ?? 0) >= dailyLimit) {
           return json({ error: "Se alcanzó el límite diario de consultas" }, 429);
         }
@@ -620,7 +640,7 @@ export default {
         if (!geminiResponse.ok) {
           await env.DB.prepare(
             "INSERT INTO gemini_usage (id,user_id,model,input_chars,output_chars,latency_ms,success,error_code,created_at) VALUES (?1,?2,?3,?4,0,?5,0,?6,?7)"
-          ).bind(uuid(), authenticatedSession.id, model, prompt.length, Date.now() - started, String(responseBody.error?.code ?? "gemini_error"), now()).run();
+          ).bind(uuid(), chatUserId, model, prompt.length, Date.now() - started, String(responseBody.error?.code ?? "gemini_error"), now()).run();
           return json({ error: "Gemini no pudo procesar la consulta" }, 502);
         }
         const answer = responseBody.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("\n").trim();
@@ -628,13 +648,13 @@ export default {
         await env.DB.batch([
           env.DB.prepare(
             "INSERT INTO gemini_usage (id,user_id,model,input_chars,output_chars,latency_ms,success,error_code,created_at) VALUES (?1,?2,?3,?4,?5,?6,1,NULL,?7)"
-          ).bind(uuid(), authenticatedSession.id, model, prompt.length, answer.length, Date.now() - started, now()),
+          ).bind(uuid(), chatUserId, model, prompt.length, answer.length, Date.now() - started, now()),
           env.DB.prepare(
             "INSERT INTO gemini_history (id,user_id,role,content_preview,created_at) VALUES (?1,?2,'user',?3,?4)"
-          ).bind(uuid(), authenticatedSession.id, prompt.slice(0, 240), now()),
+          ).bind(uuid(), chatUserId, prompt.slice(0, 240), now()),
           env.DB.prepare(
             "INSERT INTO gemini_history (id,user_id,role,content_preview,created_at) VALUES (?1,?2,'assistant',?3,?4)"
-          ).bind(uuid(), authenticatedSession.id, answer.slice(0, 240), now())
+          ).bind(uuid(), chatUserId, answer.slice(0, 240), now())
         ]);
         return json({ answer, model, disclaimer: "Asistente técnico: confirmar diagnósticos y operaciones con criterio humano." });
       }

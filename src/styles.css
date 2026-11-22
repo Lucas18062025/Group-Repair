@@ -86,6 +86,19 @@ th { color: #7a8497; font-size: 12px; text-transform: uppercase; letter-spacing:
 .gemini-answer { margin-top: 18px; border: 1px solid #e5e9f1; border-radius: 10px; background: #f8fafc; padding: 16px; white-space: pre-wrap; }
 .gemini-answer p { line-height: 1.65; }
 .gemini-answer small { color: #7a8497; }
+.operations-center { margin: 16px 0; background: #fff; border: 1px solid #e5e9f1; border-radius: 12px; padding: 20px; }
+.operations-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+.operations-heading h2 { margin: 4px 0 0; font-size: 17px; }
+.public-badge { border-radius: 999px; background: #fff4df; color: #8a5b10; padding: 6px 10px; font-size: 12px; font-weight: 700; }
+.operation-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+.operation-card { min-height: 210px; display: flex; flex-direction: column; gap: 10px; border: 1px solid #e5e9f1; border-radius: 10px; padding: 16px; }
+.operation-card h3 { margin: 0; font-size: 15px; }
+.operation-card p { flex: 1; margin: 0; color: #7a8497; font-size: 13px; line-height: 1.5; }
+.operation-card .primary { width: 100%; }
+.operation-icon { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 8px; background: #edf7f4; color: #168d77; font-size: 12px; font-weight: 800; }
+.auth-overlay { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 24px; background: rgba(23,32,51,.56); }
+.auth-overlay .auth-card { position: relative; }
+.overlay-close { position: absolute; top: 10px; right: 10px; width: 34px; height: 34px; border: 0; border-radius: 50%; background: #edf0f5; color: #59647a; cursor: pointer; }
 
 @media (max-width: 900px) {
   .app-shell { grid-template-columns: 76px 1fr; }
@@ -96,6 +109,7 @@ th { color: #7a8497; font-size: 12px; text-transform: uppercase; letter-spacing:
   .sidebar nav button::first-letter { font-size: 13px; }
   .metrics { grid-template-columns: repeat(2, 1fr); }
   .grid-two { grid-template-columns: 1fr; }
+  .operation-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .integration-grid { grid-template-columns: 1fr; }
   .allowlist-form { grid-template-columns: 1fr; }
 }
@@ -112,6 +126,8 @@ th { color: #7a8497; font-size: 12px; text-transform: uppercase; letter-spacing:
   .content { padding: 16px; }
   .notice { margin: 12px 16px 0; }
   .metrics { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .operations-heading { align-items: flex-start; flex-direction: column; }
+  .operation-grid { grid-template-columns: 1fr; }
   .metrics article { padding: 12px; }
   .metrics article strong { font-size: 18px; }
   .form-grid { grid-template-columns: 1fr; }

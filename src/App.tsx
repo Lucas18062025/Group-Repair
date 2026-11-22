@@ -130,7 +130,12 @@ function statusLabel(status: string): string {
 }
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("panel");
+  const initialTab = new URLSearchParams(window.location.search).get("tab");
+  const [tab, setTab] = useState<Tab>(
+    ["panel", "clientes", "equipos", "ordenes", "inventario", "integraciones", "gemini"].includes(initialTab ?? "")
+      ? (initialTab as Tab)
+      : "panel"
+  );
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
@@ -139,13 +144,20 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [googleSub, setGoogleSub] = useState<string | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
   const [integrations, setIntegrations] = useState<IntegrationConnection[]>([]);
   const [geminiPrompt, setGeminiPrompt] = useState("");
   const [geminiAnswer, setGeminiAnswer] = useState("");
   const [adminUsers, setAdminUsers] = useState<AuthUser[]>([]);
   const [googleAccounts, setGoogleAccounts] = useState<GoogleAllowlistAccount[]>([]);
+  const [showLoginOverlay, setShowLoginOverlay] = useState(false);
+
+  function navigateTab(nextTab: Tab) {
+    setTab(nextTab);
+    const url = new URL(window.location.href);
+    url.searchParams.set("tab", nextTab);
+    window.history.pushState({}, "", url);
+  }
 
   async function refresh() {
     setBusy(true);
@@ -173,10 +185,12 @@ export default function App() {
         const params = new URLSearchParams(window.location.search);
         if (params.get("integration_error") === "google") {
           setMessage("Google denegó la autorización. En modo Testing, agrega la cuenta como Test User o publica/verifica el proyecto.");
-          window.history.replaceState({}, "", window.location.pathname);
+          window.history.replaceState({}, "", "/?tab=integraciones");
+        } else if (params.get("integration_error") === "auth_required") {
+          setMessage("Iniciá sesión para completar la autorización de Google.");
         } else if (params.get("connected")) {
           setMessage(`Integración ${params.get("connected")} conectada`);
-          window.history.replaceState({}, "", window.location.pathname);
+          window.history.replaceState({}, "", `/?tab=integraciones`);
         }
         const [config, me] = await Promise.all([
           api<AuthConfig>("/api/auth/config"),
@@ -185,13 +199,9 @@ export default function App() {
         setAuthConfig(config);
         setAuthUser(me.user);
         setGoogleSub(me.googleSub ?? null);
-        if (me.user?.status === "APPROVED") {
-          await refresh();
-        }
+        await refresh();
       } catch (error) {
         setMessage(error instanceof Error ? error.message : "Error al verificar la sesión");
-      } finally {
-        setAuthLoading(false);
       }
     })();
   }, []);
@@ -276,7 +286,18 @@ export default function App() {
       cancelled = true;
       if (timeoutId) window.clearTimeout(timeoutId);
     };
-  }, [authConfig]);
+  }, [authConfig, showLoginOverlay]);
+
+  useEffect(() => {
+    const syncTab = () => {
+      const route = new URLSearchParams(window.location.search).get("tab");
+      if (route && ["panel", "clientes", "equipos", "ordenes", "inventario", "integraciones", "gemini"].includes(route)) {
+        setTab(route as Tab);
+      }
+    };
+    window.addEventListener("popstate", syncTab);
+    return () => window.removeEventListener("popstate", syncTab);
+  }, []);
 
   async function loadIntegrations() {
     try {
@@ -492,44 +513,33 @@ export default function App() {
   }
 
   return (
-    authLoading ? (
-      <div className="auth-screen"><div className="auth-card"><span className="loading">Verificando sesión</span></div></div>
-    ) : !authUser ? (
-      <div className="auth-screen">
-        <main className="auth-card" aria-labelledby="login-title">
-          <img className="auth-logo" src="/Group-Repair.jpg" alt="Group Repair" />
-          <h1 id="login-title">Acceso a Group Repair</h1>
-          <p>Utilizá tu cuenta Google autorizada para continuar.</p>
-          {authConfig?.googleConfigured ? (
-            <div id="google-signin-button" className="google-signin"></div>
-          ) : (
-            <div className="notice">Google Sign-In pendiente de configuración externa.</div>
-          )}
-          {message && <div className="notice login-error" role="alert">{message}</div>}
-          <small className="auth-links">
-            <a href="/privacy" target="_blank" rel="noreferrer">Privacidad</a>
-            <span> · </span>
-            <a href="/terms" target="_blank" rel="noreferrer">Términos</a>
-          </small>
-        </main>
-      </div>
-    ) : authUser.status !== "APPROVED" ? (
-      <div className="auth-screen">
-        <main className="auth-card pending-card" aria-labelledby="pending-title">
-          <img className="auth-logo" src="/Group-Repair.jpg" alt="Group Repair" />
-          <h1 id="pending-title">Cuenta pendiente</h1>
-          <p>Tu usuario fue registrado y necesita aprobación del administrador.</p>
-          {googleSub && (
-            <div className="google-sub-box">
-              <small>Identificador Google (`sub`)</small>
-              <code>{googleSub}</code>
-            </div>
-          )}
-          <button className="primary" type="button" onClick={logout}>Cerrar sesión</button>
-        </main>
-      </div>
-    ) :
-    <div className="app-shell">
+    <>
+      {showLoginOverlay && (
+        <div className="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="login-title">
+          <main className="auth-card" aria-labelledby="login-title">
+            <button className="overlay-close" type="button" aria-label="Cerrar" onClick={() => setShowLoginOverlay(false)}>×</button>
+            <img className="auth-logo" src="/Group-Repair.jpg" alt="Group Repair" />
+            <h1 id="login-title">Acceso administrativo</h1>
+            {authUser?.status === "APPROVED" ? (
+              <p>Sesión iniciada como {authUser.name}. Las integraciones protegidas ya están disponibles.</p>
+            ) : authUser?.status === "PENDING" ? (
+              <p>Tu cuenta está pendiente de aprobación. {googleSub ? `Identificador Google: ${googleSub}` : ""}</p>
+            ) : authConfig?.googleConfigured ? (
+              <div id="google-signin-button" className="google-signin"></div>
+            ) : (
+              <div className="notice">Google Sign-In pendiente de configuración externa.</div>
+            )}
+            {message && <div className="notice login-error" role="alert">{message}</div>}
+            {authUser && <button className="primary" type="button" onClick={logout}>Cerrar sesión</button>}
+            <small className="auth-links">
+              <a href="/privacy" target="_blank" rel="noreferrer">Privacidad</a>
+              <span> · </span>
+              <a href="/terms" target="_blank" rel="noreferrer">Términos</a>
+            </small>
+          </main>
+        </div>
+      )}
+      <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
           <img className="brand-mark" src="/Group-Repair.jpg" alt="Logo de Group Repair" />
@@ -545,18 +555,27 @@ export default function App() {
             ["integraciones", "Integraciones"],
             ["gemini", "Inteligencia"]
           ] as Array<[Tab, string]>).map(([key, label]) => (
-            <button key={key} className={tab === key ? "active" : ""} onClick={() => setTab(key)}>{label}</button>
+            <button key={key} className={tab === key ? "active" : ""} onClick={() => navigateTab(key)}>{label}</button>
           ))}
         </nav>
       </aside>
 
       <main>
         <header className="topbar">
-          <div><p className="eyebrow">Gestión operativa</p><h1>{tab === "panel" ? "Panel general" : tab[0].toUpperCase() + tab.slice(1)}</h1></div>
+          <div><p className="eyebrow">Gestión operativa</p><h1>{tab === "panel" ? "Panel general" : tab === "gemini" ? "Group Repair Intelligence" : tab[0].toUpperCase() + tab.slice(1)}</h1></div>
           <div className="topbar-actions">
             {busy && <span className="loading">Actualizando</span>}
-            <span className="session-user">{authUser.name}</span>
-            <button className="secondary" type="button" onClick={logout}>Cerrar sesión</button>
+            {authUser?.status === "APPROVED" ? (
+              <>
+                <span className="session-user">{authUser.name}</span>
+                <button className="secondary" type="button" onClick={logout}>Cerrar sesión</button>
+              </>
+            ) : (
+              <>
+                <span className="session-user">Acceso público</span>
+                <button className="secondary" type="button" onClick={() => setShowLoginOverlay(true)}>Acceso administrativo</button>
+              </>
+            )}
           </div>
         </header>
 
@@ -570,6 +589,44 @@ export default function App() {
               <article><span>Cobrado neto</span><strong>{formatMoney(dashboard?.collectedMinor ?? 0)}</strong></article>
               <article><span>Órdenes activas</span><strong>{dashboard?.ordersByStatus.filter(row => row.status !== "DELIVERED" && row.status !== "CANCELLED").reduce((sum, row) => sum + row.count, 0) ?? 0}</strong></article>
             </div>
+            <section className="operations-center" aria-labelledby="operations-title">
+              <div className="operations-heading">
+                <div><p className="eyebrow">Accesos directos</p><h2 id="operations-title">Centro de operaciones</h2></div>
+                <span className="public-badge">Acceso público temporal</span>
+              </div>
+              <div className="operation-grid">
+                <article className="operation-card">
+                  <span className="operation-icon" aria-hidden="true">01</span>
+                  <h3>Órdenes</h3>
+                  <p>Estados, diagnósticos, presupuestos y seguimiento de reparaciones.</p>
+                  <button className="primary" type="button" onClick={() => navigateTab("ordenes")}>Abrir gestión</button>
+                </article>
+                <article className="operation-card">
+                  <span className="operation-icon" aria-hidden="true">02</span>
+                  <h3>Integraciones</h3>
+                  <p>Google Drive, Sheets, Photos y estado real de cada conexión.</p>
+                  <button className="primary" type="button" onClick={() => navigateTab("integraciones")}>Abrir integraciones</button>
+                </article>
+                <article className="operation-card">
+                  <span className="operation-icon" aria-hidden="true">03</span>
+                  <h3>Group Repair Intelligence</h3>
+                  <p>{authConfig?.geminiConfigured ? "Gemini configurado y disponible para consultas." : "Gemini pendiente de configuración con GEMINI_API_KEY."}</p>
+                  <button className="primary" type="button" onClick={() => navigateTab("gemini")}>Abrir asistente</button>
+                </article>
+                <article className="operation-card">
+                  <span className="operation-icon" aria-hidden="true">04</span>
+                  <h3>Clientes</h3>
+                  <p>Administrar clientes y vincular equipos y órdenes de reparación.</p>
+                  <button className="primary" type="button" onClick={() => navigateTab("clientes")}>Gestionar clientes</button>
+                </article>
+                <article className="operation-card">
+                  <span className="operation-icon" aria-hidden="true">05</span>
+                  <h3>Inventario</h3>
+                  <p>Componentes, repuestos, existencias y alertas de stock.</p>
+                  <button className="primary" type="button" onClick={() => navigateTab("inventario")}>Abrir inventario</button>
+                </article>
+              </div>
+            </section>
             <div className="grid-two">
               <article className="panel-card">
                 <h2>Órdenes por estado</h2>
@@ -697,9 +754,24 @@ export default function App() {
                   </article>
                 );
               })}
+              <article className="panel-card integration-card">
+                <div>
+                  <h2>Gemini</h2>
+                  <p>Asistente técnico de Group Repair Intelligence.</p>
+                </div>
+                <span className={`integration-status ${authConfig?.geminiConfigured ? "connected" : ""}`}>
+                  {authConfig?.geminiConfigured ? "Configurado" : "Pendiente"}
+                </span>
+                {authConfig?.geminiConfigured ? (
+                  <small>API key disponible en Cloudflare Workers.</small>
+                ) : (
+                  <p className="integration-error">Gemini está pendiente de configuración. Es necesario configurar <code>GEMINI_API_KEY</code> en Cloudflare Workers.</p>
+                )}
+                <button className="primary" type="button" onClick={() => navigateTab("gemini")}>Abrir Intelligence</button>
+              </article>
             </div>
 
-            {authUser.role === "admin" && (
+            {authUser?.role === "admin" && (
               <>
                 <article className="panel-card admin-users">
                   <h2>Cuentas Google autorizadas</h2>
@@ -794,6 +866,7 @@ export default function App() {
           </span>
         </footer>
       </main>
-    </div>
+      </div>
+    </>
   );
 }
