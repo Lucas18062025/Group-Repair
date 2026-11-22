@@ -235,6 +235,17 @@ export default {
           const allowlistEntry = await env.DB.prepare(
             "SELECT id FROM google_access_allowlist WHERE workshop_id=?1 AND status='ACTIVE' AND (google_sub=?2 OR email=?3)"
           ).bind(WORKSHOP_ID, payload.sub, payload.email).first("id");
+          const activeAdmins = await env.DB.prepare(
+            "SELECT COUNT(*) AS count FROM users WHERE role='admin' AND status='APPROVED' AND deactivated_at IS NULL"
+          ).bind().first<number>("count");
+          const isBootstrapAdmin = Boolean(
+            activeAdmins === 0 &&
+            env.GOOGLE_BOOTSTRAP_SUB &&
+            env.GOOGLE_BOOTSTRAP_SUB === payload.sub
+          );
+          if (!allowlistEntry && !isBootstrapAdmin) {
+            return json({ error: "Cuenta no autorizada" }, 403);
+          }
           if (allowlistEntry && user.status === "PENDING") {
             await env.DB.prepare(
               "UPDATE users SET status='APPROVED',deactivated_at=NULL WHERE id=?1"

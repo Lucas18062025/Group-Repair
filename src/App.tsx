@@ -492,6 +492,7 @@ export default function App() {
           ) : (
             <div className="notice">Google Sign-In pendiente de configuración externa.</div>
           )}
+          {message && <div className="notice login-error" role="alert">{message}</div>}
         </main>
       </div>
     ) : authUser.status !== "APPROVED" ? (
