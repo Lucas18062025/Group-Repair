@@ -9,7 +9,7 @@
     "not_found_handling": "single-page-application"
   },
   "vars": {
-    "GOOGLE_REDIRECT_URI": "https://group-repair.lucaslean1806.workers.dev/api/integrations/google/callback"
+    "GOOGLE_REDIRECT_URI": "https://group-repair.lucaslean1806.workers.dev/api/auth/callback/google"
   },
   "d1_databases": [
     {
