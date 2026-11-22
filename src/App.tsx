@@ -1,6 +1,46 @@
 import { useEffect, useState, type FormEvent } from "react";
 
-type Tab = "panel" | "clientes" | "equipos" | "ordenes" | "inventario";
+type Tab = "panel" | "clientes" | "equipos" | "ordenes" | "inventario" | "integraciones" | "gemini";
+
+declare global {
+  interface Window {
+    google?: {
+      accounts?: {
+        id?: {
+          initialize: (options: { client_id: string; callback: (response: { credential: string }) => void; nonce?: string }) => void;
+          renderButton: (element: HTMLElement, options: Record<string, unknown>) => void;
+          disableAutoSelect: () => void;
+        };
+      };
+    };
+  }
+}
+
+interface AuthUser {
+  id: string;
+  name: string;
+  email: string;
+  role: string;
+  status: string;
+}
+
+interface AuthConfig {
+  googleConfigured: boolean;
+  googleClientId: string | null;
+  geminiConfigured: boolean;
+}
+
+interface IntegrationConnection {
+  service: string;
+  account_email: string | null;
+  status: string;
+  scopes: string | null;
+  expires_at: string | null;
+  connected_at: string | null;
+  last_sync_at: string | null;
+  error: string | null;
+  updated_at: string;
+}
 
 interface Customer {
   id: string;
@@ -83,6 +123,13 @@ export default function App() {
   const [parts, setParts] = useState<Part[]>([]);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
+  const [integrations, setIntegrations] = useState<IntegrationConnection[]>([]);
+  const [geminiPrompt, setGeminiPrompt] = useState("");
+  const [geminiAnswer, setGeminiAnswer] = useState("");
+  const [adminUsers, setAdminUsers] = useState<AuthUser[]>([]);
 
   async function refresh() {
     setBusy(true);
@@ -105,8 +152,148 @@ export default function App() {
   }
 
   useEffect(() => {
-    void refresh();
+    void (async () => {
+      try {
+        const [config, me] = await Promise.all([
+          api<AuthConfig>("/api/auth/config"),
+          api<{ user: AuthUser | null }>("/api/auth/me")
+        ]);
+        setAuthConfig(config);
+        setAuthUser(me.user);
+        if (me.user?.status === "APPROVED") {
+          await refresh();
+        }
+      } catch (error) {
+        setMessage(error instanceof Error ? error.message : "Error al verificar la sesión");
+      } finally {
+        setAuthLoading(false);
+      }
+    })();
   }, []);
+
+  useEffect(() => {
+    if (!authConfig?.googleConfigured || !authConfig.googleClientId) return;
+    const existing = document.querySelector<HTMLScriptElement>('script[src="https://accounts.google.com/gsi/client"]');
+    const initialize = async () => {
+      const nonceResponse = await api<{ nonce: string }>("/api/auth/nonce", { method: "POST" });
+      window.google?.accounts?.id?.initialize({
+        client_id: authConfig.googleClientId!,
+        nonce: nonceResponse.nonce,
+        callback: async (response) => {
+          setBusy(true);
+          try {
+            const result = await api<{ user: AuthUser }>("/api/auth/google", {
+              method: "POST",
+              body: JSON.stringify({ credential: response.credential, nonce: nonceResponse.nonce })
+            });
+            setAuthUser(result.user);
+            setMessage(result.user.status === "APPROVED" ? "Sesión iniciada" : "Cuenta creada. Pendiente de aprobación.");
+            if (result.user.status === "APPROVED") await refresh();
+          } catch (error) {
+            setMessage(error instanceof Error ? error.message : "No se pudo iniciar sesión");
+          } finally {
+            setBusy(false);
+          }
+        }
+      });
+      const button = document.getElementById("google-signin-button");
+      if (button) {
+        window.google?.accounts?.id?.renderButton(button, {
+          type: "standard",
+          theme: "outline",
+          size: "large",
+          text: "continue_with",
+          shape: "rectangular",
+          width: 280,
+          locale: "es"
+        });
+      }
+    };
+    if (existing) {
+      void initialize();
+    } else {
+      const script = document.createElement("script");
+      script.src = "https://accounts.google.com/gsi/client";
+      script.async = true;
+      script.onload = () => { void initialize(); };
+      document.head.appendChild(script);
+    }
+  }, [authConfig]);
+
+  async function loadIntegrations() {
+    try {
+      const result = await api<{ connections: IntegrationConnection[] }>("/api/integrations");
+      setIntegrations(result.connections);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudieron cargar las integraciones");
+    }
+  }
+
+  useEffect(() => {
+    if (authUser?.status === "APPROVED" && tab === "integraciones") void loadIntegrations();
+  }, [tab, authUser]);
+
+  useEffect(() => {
+    if (authUser?.status === "APPROVED" && authUser.role === "admin" && tab === "integraciones") {
+      void api<{ users: AuthUser[] }>("/api/admin/users")
+        .then((result) => setAdminUsers(result.users))
+        .catch((error) => setMessage(error instanceof Error ? error.message : "No se pudieron cargar usuarios"));
+    }
+  }, [tab, authUser]);
+
+  async function startIntegration(service: "google_drive" | "google_sheets" | "google_photos") {
+    try {
+      const result = await api<{ authUrl: string }>(`/api/integrations/${service}/start`, { method: "POST" });
+      window.location.assign(result.authUrl);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo iniciar la conexión");
+    }
+  }
+
+  async function disconnectIntegration(service: "google_drive" | "google_sheets" | "google_photos") {
+    try {
+      await api(`/api/integrations/${service}/disconnect`, { method: "POST" });
+      await loadIntegrations();
+      setMessage("Integración desconectada");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo desconectar");
+    }
+  }
+
+  async function updateUserStatus(userId: string, action: "approve" | "deactivate") {
+    try {
+      await api(`/api/admin/users/${userId}/${action}`, { method: "POST" });
+      setAdminUsers((users) => users.map((user) => user.id === userId
+        ? { ...user, status: action === "approve" ? "APPROVED" : "DEACTIVATED" }
+        : user));
+      setMessage(action === "approve" ? "Usuario aprobado" : "Usuario desactivado");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo actualizar el usuario");
+    }
+  }
+
+  async function logout() {
+    await api("/api/auth/logout", { method: "POST" });
+    setAuthUser(null);
+    setMessage("Sesión cerrada");
+  }
+
+  async function submitGemini(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setGeminiAnswer("");
+    try {
+      const result = await api<{ answer: string }>("/api/gemini/chat", {
+        method: "POST",
+        body: JSON.stringify({ prompt: geminiPrompt })
+      });
+      setGeminiAnswer(result.answer);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Gemini no pudo responder");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function submitCustomer(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -197,6 +384,32 @@ export default function App() {
   }
 
   return (
+    authLoading ? (
+      <div className="auth-screen"><div className="auth-card"><span className="loading">Verificando sesión</span></div></div>
+    ) : !authUser ? (
+      <div className="auth-screen">
+        <main className="auth-card" aria-labelledby="login-title">
+          <img className="auth-logo" src="/Group-Repair.jpg" alt="Group Repair" />
+          <h1 id="login-title">Acceso a Group Repair</h1>
+          <p>Utilizá tu cuenta Google autorizada para continuar.</p>
+          {authConfig?.googleConfigured ? (
+            <div id="google-signin-button" className="google-signin"></div>
+          ) : (
+            <div className="notice">Google Sign-In pendiente de configuración externa.</div>
+          )}
+          <small>El primer administrador se provisiona mediante `GOOGLE_BOOTSTRAP_SUB`.</small>
+        </main>
+      </div>
+    ) : authUser.status !== "APPROVED" ? (
+      <div className="auth-screen">
+        <main className="auth-card pending-card" aria-labelledby="pending-title">
+          <img className="auth-logo" src="/Group-Repair.jpg" alt="Group Repair" />
+          <h1 id="pending-title">Cuenta pendiente</h1>
+          <p>Tu usuario fue registrado y necesita aprobación del administrador.</p>
+          <button className="primary" type="button" onClick={logout}>Cerrar sesión</button>
+        </main>
+      </div>
+    ) :
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
@@ -209,7 +422,9 @@ export default function App() {
             ["clientes", "Clientes"],
             ["equipos", "Equipos"],
             ["ordenes", "Órdenes"],
-            ["inventario", "Inventario"]
+            ["inventario", "Inventario"],
+            ["integraciones", "Integraciones"],
+            ["gemini", "Inteligencia"]
           ] as Array<[Tab, string]>).map(([key, label]) => (
             <button key={key} className={tab === key ? "active" : ""} onClick={() => setTab(key)}>{label}</button>
           ))}
@@ -219,7 +434,11 @@ export default function App() {
       <main>
         <header className="topbar">
           <div><p className="eyebrow">Gestión operativa</p><h1>{tab === "panel" ? "Panel general" : tab[0].toUpperCase() + tab.slice(1)}</h1></div>
-          {busy && <span className="loading">Actualizando</span>}
+          <div className="topbar-actions">
+            {busy && <span className="loading">Actualizando</span>}
+            <span className="session-user">{authUser.name}</span>
+            <button className="secondary" type="button" onClick={logout}>Cerrar sesión</button>
+          </div>
         </header>
 
         {message && <div className="notice" role="status">{message}<button aria-label="Cerrar" onClick={() => setMessage("")}>×</button></div>}
@@ -328,6 +547,78 @@ export default function App() {
               <div className="table-wrap"><table><thead><tr><th>SKU</th><th>Repuesto</th><th>Stock</th><th>Precio</th></tr></thead><tbody>
                 {parts.map(part => <tr key={part.id}><td>{part.sku}</td><td>{part.name}</td><td>{part.stock}</td><td>{formatMoney(part.sale_price_minor)}</td></tr>)}
               </tbody></table></div>
+            </article>
+          </section>
+        )}
+
+        {tab === "integraciones" && (
+          <section className="content">
+            <div className="integration-grid">
+              {([
+                ["google_drive", "Google Drive", "Adjuntar documentación y archivos de órdenes.", "google_drive"],
+                ["google_sheets", "Google Sheets", "Exportar e importar datos estructurados.", "google_sheets"],
+                ["google_photos", "Google Photos", "Seleccionar fotografías mediante Photos Picker.", "google_photos"]
+              ] as Array<[IntegrationConnection["service"], string, string, "google_drive" | "google_sheets" | "google_photos"]>).map(([service, title, description, serviceKey]) => {
+                const connection = integrations.find((item) => item.service === service);
+                const connected = connection?.status === "connected";
+                return (
+                  <article className="panel-card integration-card" key={service}>
+                    <div>
+                      <h2>{title}</h2>
+                      <p>{description}</p>
+                    </div>
+                    <span className={`integration-status ${connected ? "connected" : ""}`}>{connected ? "Conectado" : "Desconectado"}</span>
+                    {connection?.account_email && <small>Cuenta: {connection.account_email}</small>}
+                    {connection?.error && <p className="integration-error">{connection.error}</p>}
+                    {connected ? (
+                      <button className="secondary" type="button" onClick={() => disconnectIntegration(serviceKey)}>Desconectar</button>
+                    ) : (
+                      <button className="primary" type="button" onClick={() => startIntegration(serviceKey)}>Conectar</button>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
+
+            {authUser.role === "admin" && (
+              <article className="panel-card admin-users">
+                <h2>Usuarios pendientes y acceso</h2>
+                <div className="table-wrap">
+                  <table>
+                    <thead><tr><th>Usuario</th><th>Email</th><th>Rol</th><th>Estado</th><th>Acción</th></tr></thead>
+                    <tbody>
+                      {adminUsers.map((user) => (
+                        <tr key={user.id}>
+                          <td>{user.name}</td><td>{user.email}</td><td>{user.role}</td><td>{user.status}</td>
+                          <td>
+                            {user.status === "PENDING" && <button className="secondary" type="button" onClick={() => updateUserStatus(user.id, "approve")}>Aprobar</button>}
+                            {user.status === "APPROVED" && user.id !== authUser.id && <button className="secondary" type="button" onClick={() => updateUserStatus(user.id, "deactivate")}>Desactivar</button>}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+            )}
+          </section>
+        )}
+
+        {tab === "gemini" && (
+          <section className="content">
+            <article className="panel-card gemini-card">
+              <h2>Group Repair Intelligence</h2>
+              {authConfig?.geminiConfigured ? (
+                <form className="form" onSubmit={submitGemini}>
+                  <label>Consulta técnica
+                    <textarea value={geminiPrompt} onChange={(event) => setGeminiPrompt(event.target.value)} maxLength={4000} required />
+                  </label>
+                  <button className="primary" type="submit" disabled={busy}>Consultar</button>
+                </form>
+              ) : (
+                <div className="notice">Gemini pendiente de configuración. Falta configurar el secreto <code>GEMINI_API_KEY</code>.</div>
+              )}
+              {geminiAnswer && <div className="gemini-answer"><strong>Respuesta</strong><p>{geminiAnswer}</p><small>Asistente técnico: confirmar diagnósticos y operaciones con criterio humano.</small></div>}
             </article>
           </section>
         )}

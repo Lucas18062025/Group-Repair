@@ -56,6 +56,30 @@ th { color: #7a8497; font-size: 12px; text-transform: uppercase; letter-spacing:
 .author-footer a { color: #168d77; font-weight: 700; text-decoration: none; }
 .author-footer a:hover { text-decoration: underline; }
 .storage-card p { margin: 8px 0; }
+.topbar-actions { display: flex; align-items: center; gap: 10px; }
+.session-user { color: #59647a; font-size: 13px; }
+.secondary { min-height: 38px; border: 1px solid #ccd3df; border-radius: 8px; background: #fff; color: #59647a; padding: 0 12px; cursor: pointer; }
+.auth-screen { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: #f4f6fa; }
+.auth-card { width: min(420px, 100%); display: flex; flex-direction: column; align-items: center; text-align: center; gap: 12px; border: 1px solid #e5e9f1; border-radius: 16px; background: #fff; padding: 36px 32px; box-shadow: 0 12px 32px rgba(23,32,51,.08); }
+.auth-card h1 { margin: 4px 0 0; font-size: 24px; }
+.auth-card p { margin: 0 0 8px; color: #7a8497; }
+.auth-card small { color: #7a8497; }
+.auth-logo { width: 154px; height: auto; max-height: 86px; object-fit: contain; }
+.google-signin { min-height: 44px; display: grid; place-items: center; }
+.pending-card .primary { width: 100%; }
+.integration-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-bottom: 16px; }
+.integration-card { display: flex; flex-direction: column; gap: 12px; }
+.integration-card h2 { margin-bottom: 6px; }
+.integration-card p { margin: 0; color: #7a8497; }
+.integration-card small { color: #59647a; }
+.integration-status { align-self: flex-start; border-radius: 999px; padding: 5px 9px; background: #edf0f5; color: #7a8497; font-size: 12px; }
+.integration-status.connected { background: #e7f6f1; color: #176c5d; }
+.integration-error { color: #a84f35 !important; }
+.admin-users { margin-top: 16px; }
+.gemini-card textarea { min-height: 140px; resize: vertical; border: 1px solid #ccd3df; border-radius: 8px; padding: 10px; color: #172033; }
+.gemini-answer { margin-top: 18px; border: 1px solid #e5e9f1; border-radius: 10px; background: #f8fafc; padding: 16px; white-space: pre-wrap; }
+.gemini-answer p { line-height: 1.65; }
+.gemini-answer small { color: #7a8497; }
 
 @media (max-width: 900px) {
   .app-shell { grid-template-columns: 76px 1fr; }
@@ -66,6 +90,7 @@ th { color: #7a8497; font-size: 12px; text-transform: uppercase; letter-spacing:
   .sidebar nav button::first-letter { font-size: 13px; }
   .metrics { grid-template-columns: repeat(2, 1fr); }
   .grid-two { grid-template-columns: 1fr; }
+  .integration-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 600px) {

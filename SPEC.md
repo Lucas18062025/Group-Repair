@@ -160,3 +160,12 @@ El despliegue debe documentar configuración, variables de entorno, migraciones,
 ## 10. Pendientes antes de producción
 
 Antes de operar con datos reales, completar: impuestos fiscales aplicables, consentimientos y retención, plantilla de documentos, canales de notificación, proveedor de identidad/pagos, volumen esperado y objetivos de disponibilidad/recuperación.
+
+## 11. Integraciones Google y Gemini
+
+- Google Sign-In valida OIDC/ID Token, nonce, audiencia, emisor, expiración y firma de Google.
+- Nuevas cuentas quedan PENDING y requieren aprobación administrativa.
+- Google está separado de Drive, Sheets y Photos; no concede acceso incremental automáticamente.
+- OAuth utiliza state, PKCE, cifrado AES-GCM de tokens y desconexión por servicio.
+- Gemini opera mediante secreto independiente, límites diarios, timeout y registro de uso.
+- Las integraciones reales requieren credenciales de Google Cloud Console y Google AI Studio; no deben declararse activas hasta completar configuración y pruebas.
