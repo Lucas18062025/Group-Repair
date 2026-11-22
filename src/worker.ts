@@ -167,9 +167,9 @@ export default {
           "SELECT id FROM oauth_states WHERE nonce=?1 AND used_at IS NULL AND expires_at>?2"
         ).bind(nonce, now()).first("id");
         if (!nonceRecord) return json({ error: "Nonce inválido o expirado" }, 401);
-        await env.DB.prepare("UPDATE oauth_states SET used_at=?1 WHERE nonce=?2").bind(now(), nonce).run();
 
         const payload = await verifyGoogleIdToken(credential, env.GOOGLE_CLIENT_ID, nonce);
+        await env.DB.prepare("UPDATE oauth_states SET used_at=?1 WHERE nonce=?2 AND used_at IS NULL").bind(now(), nonce).run();
         if (payload.email_verified !== true) return json({ error: "El correo de Google no está verificado" }, 403);
         if (!payload.email) return json({ error: "La cuenta de Google no proporcionó correo" }, 403);
 
@@ -195,10 +195,10 @@ export default {
           const isInitialBootstrap = activeAdmins === 0 && !env.GOOGLE_BOOTSTRAP_SUB;
 
           if (activeAdmins !== 0 && !isBootstrapAdmin && !isAllowlisted) {
-            return json({ error: "Cuenta Google no autorizada por el administrador" }, 403);
+            return json({ error: "Cuenta no autorizada" }, 403);
           }
           if (activeAdmins === 0 && env.GOOGLE_BOOTSTRAP_SUB && !isBootstrapAdmin) {
-            return json({ error: "Cuenta Google no autorizada para el aprovisionamiento inicial" }, 403);
+            return json({ error: "Cuenta no autorizada" }, 403);
           }
           if (activeAdmins === 0 && isInitialBootstrap) {
             // The first verified Google account remains pending until GOOGLE_BOOTSTRAP_SUB is configured.

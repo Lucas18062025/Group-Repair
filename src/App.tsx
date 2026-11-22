@@ -223,7 +223,20 @@ export default function App() {
               setMessage(result.user.status === "APPROVED" ? "Sesión iniciada" : "Cuenta creada. Pendiente de aprobación.");
               if (result.user.status === "APPROVED") await refresh();
             } catch (error) {
-              setMessage(error instanceof Error ? error.message : "No se pudo iniciar sesión");
+              const loginError = error instanceof Error ? error.message : "No se pudo iniciar sesión";
+              try {
+                const session = await api<AuthMe>("/api/auth/me");
+                if (session.user?.status === "APPROVED") {
+                  setAuthUser(session.user);
+                  setGoogleSub(session.googleSub ?? null);
+                  setMessage("Sesión iniciada");
+                  await refresh();
+                  return;
+                }
+              } catch {
+                // Keep the original login error visible.
+              }
+              setMessage(loginError);
             } finally {
               setBusy(false);
             }
