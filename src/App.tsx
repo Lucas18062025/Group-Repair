@@ -24,6 +24,11 @@ interface AuthUser {
   status: string;
 }
 
+interface AuthMe {
+  user: AuthUser | null;
+  googleSub?: string | null;
+}
+
 interface AuthConfig {
   googleConfigured: boolean;
   googleClientId: string | null;
@@ -39,6 +44,15 @@ interface IntegrationConnection {
   connected_at: string | null;
   last_sync_at: string | null;
   error: string | null;
+  updated_at: string;
+}
+
+interface GoogleAllowlistAccount {
+  id: string;
+  email: string;
+  google_sub: string | null;
+  status: string;
+  created_at: string;
   updated_at: string;
 }
 
@@ -124,12 +138,14 @@ export default function App() {
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [googleSub, setGoogleSub] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
   const [integrations, setIntegrations] = useState<IntegrationConnection[]>([]);
   const [geminiPrompt, setGeminiPrompt] = useState("");
   const [geminiAnswer, setGeminiAnswer] = useState("");
   const [adminUsers, setAdminUsers] = useState<AuthUser[]>([]);
+  const [googleAccounts, setGoogleAccounts] = useState<GoogleAllowlistAccount[]>([]);
 
   async function refresh() {
     setBusy(true);
@@ -156,10 +172,11 @@ export default function App() {
       try {
         const [config, me] = await Promise.all([
           api<AuthConfig>("/api/auth/config"),
-          api<{ user: AuthUser | null }>("/api/auth/me")
+          api<AuthMe>("/api/auth/me")
         ]);
         setAuthConfig(config);
         setAuthUser(me.user);
+        setGoogleSub(me.googleSub ?? null);
         if (me.user?.status === "APPROVED") {
           await refresh();
         }
@@ -182,11 +199,12 @@ export default function App() {
         callback: async (response) => {
           setBusy(true);
           try {
-            const result = await api<{ user: AuthUser }>("/api/auth/google", {
+            const result = await api<{ user: AuthUser; googleSub: string }>("/api/auth/google", {
               method: "POST",
               body: JSON.stringify({ credential: response.credential, nonce: nonceResponse.nonce })
             });
             setAuthUser(result.user);
+            setGoogleSub(result.googleSub);
             setMessage(result.user.status === "APPROVED" ? "Sesión iniciada" : "Cuenta creada. Pendiente de aprobación.");
             if (result.user.status === "APPROVED") await refresh();
           } catch (error) {
@@ -235,8 +253,14 @@ export default function App() {
 
   useEffect(() => {
     if (authUser?.status === "APPROVED" && authUser.role === "admin" && tab === "integraciones") {
-      void api<{ users: AuthUser[] }>("/api/admin/users")
-        .then((result) => setAdminUsers(result.users))
+      void Promise.all([
+        api<{ users: AuthUser[] }>("/api/admin/users"),
+        api<{ accounts: GoogleAllowlistAccount[] }>("/api/admin/google-accounts")
+      ])
+        .then(([usersResult, accountsResult]) => {
+          setAdminUsers(usersResult.users);
+          setGoogleAccounts(accountsResult.accounts);
+        })
         .catch((error) => setMessage(error instanceof Error ? error.message : "No se pudieron cargar usuarios"));
     }
   }, [tab, authUser]);
@@ -276,6 +300,37 @@ export default function App() {
     await api("/api/auth/logout", { method: "POST" });
     setAuthUser(null);
     setMessage("Sesión cerrada");
+  }
+
+  async function addGoogleAccount(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    try {
+      await api("/api/admin/google-accounts", {
+        method: "POST",
+        body: JSON.stringify({
+          email: data.get("email"),
+          googleSub: data.get("googleSub") || null
+        })
+      });
+      form.reset();
+      const result = await api<{ accounts: GoogleAllowlistAccount[] }>("/api/admin/google-accounts");
+      setGoogleAccounts(result.accounts);
+      setMessage("Cuenta Google autorizada");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo autorizar la cuenta");
+    }
+  }
+
+  async function removeGoogleAccount(accountId: string) {
+    try {
+      await api(`/api/admin/google-accounts/${accountId}`, { method: "DELETE" });
+      setGoogleAccounts((accounts) => accounts.filter((account) => account.id !== accountId));
+      setMessage("Cuenta Google retirada");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo retirar la cuenta");
+    }
   }
 
   async function submitGemini(event: FormEvent<HTMLFormElement>) {
@@ -406,6 +461,13 @@ export default function App() {
           <img className="auth-logo" src="/Group-Repair.jpg" alt="Group Repair" />
           <h1 id="pending-title">Cuenta pendiente</h1>
           <p>Tu usuario fue registrado y necesita aprobación del administrador.</p>
+          {googleSub && (
+            <div className="google-sub-box">
+              <small>Identificador Google (`sub`)</small>
+              <code>{googleSub}</code>
+              <small>Este valor permite provisionar el primer administrador de forma segura.</small>
+            </div>
+          )}
           <button className="primary" type="button" onClick={logout}>Cerrar sesión</button>
         </main>
       </div>
@@ -581,8 +643,32 @@ export default function App() {
             </div>
 
             {authUser.role === "admin" && (
-              <article className="panel-card admin-users">
-                <h2>Usuarios pendientes y acceso</h2>
+              <>
+                <article className="panel-card admin-users">
+                  <h2>Cuentas Google autorizadas</h2>
+                  <form className="form allowlist-form" onSubmit={addGoogleAccount}>
+                    <label>Email autorizado<input name="email" type="email" required /></label>
+                    <label>Google <code>sub</code> (opcional)<input name="googleSub" /></label>
+                    <button className="primary" type="submit">Autorizar cuenta</button>
+                  </form>
+                  <div className="table-wrap">
+                    <table>
+                      <thead><tr><th>Email</th><th>Google sub</th><th>Estado</th><th>Acción</th></tr></thead>
+                      <tbody>
+                        {googleAccounts.map((account) => (
+                          <tr key={account.id}>
+                            <td>{account.email}</td>
+                            <td>{account.google_sub ?? "Pendiente"}</td>
+                            <td>{account.status}</td>
+                            <td><button className="secondary" type="button" onClick={() => removeGoogleAccount(account.id)}>Retirar</button></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </article>
+                <article className="panel-card admin-users">
+                  <h2>Usuarios pendientes y acceso</h2>
                 <div className="table-wrap">
                   <table>
                     <thead><tr><th>Usuario</th><th>Email</th><th>Rol</th><th>Estado</th><th>Acción</th></tr></thead>
@@ -599,7 +685,8 @@ export default function App() {
                     </tbody>
                   </table>
                 </div>
-              </article>
+                </article>
+              </>
             )}
           </section>
         )}
