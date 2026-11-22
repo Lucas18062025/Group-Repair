@@ -181,6 +181,13 @@ th { color: #7a8497; font-size: 12px; text-transform: uppercase; letter-spacing:
 .assistant-compose button { border: 0; border-radius: 8px; background: #168d77; color: #fff; padding: 0 12px; cursor: pointer; }
 .assistant-compose button:disabled { opacity: .55; cursor: not-allowed; }
 .assistant-consent { border-top: 1px solid #edf0f5; color: #7a8497; font-size: 10px; line-height: 1.35; padding: 7px 10px; }
+.assistant-consent-gate { display: grid; align-content: start; gap: 10px; overflow-y: auto; padding: 16px; background: #f8fafc; }
+.assistant-consent-gate h2 { margin: 0; font-size: 16px; color: #172033; }
+.assistant-consent-gate p, .assistant-consent-gate li { margin: 0; color: #59647a; font-size: 13px; line-height: 1.45; }
+.assistant-consent-gate ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+.assistant-consent-check { display: flex; gap: 8px; align-items: flex-start; color: #172033; font-size: 13px; line-height: 1.4; }
+.assistant-consent-check input { margin-top: 3px; }
+.assistant-consent-gate > a { color: #176c5d; font-size: 12px; }
 .customer-toolbar { margin-bottom: 12px; }
 .customer-toolbar label { display: grid; gap: 5px; max-width: 420px; color: #59647a; font-size: 12px; }
 .customer-toolbar input { height: 40px; border: 1px solid #ccd3df; border-radius: 8px; background: #fff; padding: 0 10px; }
@@ -233,5 +240,5 @@ th { color: #7a8497; font-size: 12px; text-transform: uppercase; letter-spacing:
   .drawer-details { grid-template-columns: 120px 1fr; }
   .assistant-fab { right: 12px; bottom: 12px; min-width: 56px; width: 56px; height: 56px; }
   .assistant-fab small { display: none; }
-  .assistant-widget { right: 8px; bottom: 8px; width: calc(100vw - 16px); height: calc(100vh - 16px); border-radius: 12px; }
+  .assistant-widget { right: 8px; bottom: 8px; width: calc(100vw - 16px); height: calc(100vh - 16px); height: calc(100dvh - 16px); border-radius: 12px; }
 }

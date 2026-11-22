@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 
 type Tab = "panel" | "clientes" | "equipos" | "ordenes" | "inventario" | "integraciones" | "gemini" | "asistencia";
 
@@ -150,9 +150,16 @@ interface AssistantRequest {
   request_type: string;
   status: string;
   order_id: string | null;
+  order_reference: string | null;
   created_at: string;
   updated_at: string;
 }
+
+type ChatFlow = "IDLE" | "REPAIR" | "REPAIR_CONFIRM" | "CONTACT" | "TRACK";
+
+const CHAT_GREETING = "¡Hola! Bienvenido a Group Repair.\n\nSoy el asistente virtual del taller. Puedo ayudarte a consultar reparaciones, conocer nuestros servicios o solicitar asistencia técnica.\n\n¿Qué necesitás hoy?";
+const CHAT_SESSION_KEY = "gr-chat-session";
+const CHAT_CONSENT_KEY = "gr-chat-consent";
 
 interface Dashboard {
   ordersByStatus: Array<{ status: string; count: number }>;
@@ -242,15 +249,19 @@ export default function App() {
   const [showOrderForm, setShowOrderForm] = useState(false);
   const [availableDevices, setAvailableDevices] = useState<Device[]>([]);
   const [chatOpen, setChatOpen] = useState(false);
+  const [chatConsent, setChatConsent] = useState(false);
+  const [consentChecked, setConsentChecked] = useState(false);
   const [chatPublicKey, setChatPublicKey] = useState<string | null>(null);
   const [chatConversationId, setChatConversationId] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<Array<{ role: "assistant" | "customer"; content: string }>>([
-    { role: "assistant", content: "¡Hola! Bienvenido a Group Repair.\n\nSoy el asistente virtual del taller. Puedo ayudarte a consultar reparaciones, conocer nuestros servicios o solicitar asistencia técnica.\n\n¿Qué necesitás hoy?" }
+    { role: "assistant", content: CHAT_GREETING }
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatBusy, setChatBusy] = useState(false);
-  const [chatFlow, setChatFlow] = useState<"IDLE" | "REPAIR" | "REPAIR_CONFIRM" | "CONTACT">("IDLE");
+  const [chatFlow, setChatFlow] = useState<ChatFlow>("IDLE");
   const [repairDraft, setRepairDraft] = useState<Record<string, string>>({});
+  const chatInputRef = useRef<HTMLInputElement>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
   const [assistantRequests, setAssistantRequests] = useState<AssistantRequest[]>([]);
   const [knowledgeCategory, setKnowledgeCategory] = useState("Horarios");
   const [knowledgeQuestion, setKnowledgeQuestion] = useState("");
@@ -452,6 +463,59 @@ export default function App() {
     }
   }, [tab, authUser]);
 
+  useEffect(() => {
+    try {
+      if (window.sessionStorage.getItem(CHAT_CONSENT_KEY) === "1") setChatConsent(true);
+      const raw = window.sessionStorage.getItem(CHAT_SESSION_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw) as { publicKey?: unknown; messages?: unknown; flow?: unknown; draft?: unknown };
+      if (typeof saved.publicKey === "string" && saved.publicKey) setChatPublicKey(saved.publicKey);
+      if (Array.isArray(saved.messages)) {
+        const restored = (saved.messages as unknown[]).filter(
+          (item): item is { role: "assistant" | "customer"; content: string } => {
+            if (!item || typeof item !== "object") return false;
+            const entry = item as { role?: unknown; content?: unknown };
+            return (entry.role === "assistant" || entry.role === "customer") && typeof entry.content === "string";
+          }
+        ).slice(-60);
+        if (restored.length > 0) setChatMessages(restored);
+      }
+      if (saved.flow === "REPAIR" || saved.flow === "REPAIR_CONFIRM" || saved.flow === "CONTACT" || saved.flow === "TRACK") {
+        setChatFlow(saved.flow);
+      }
+      if (saved.draft && typeof saved.draft === "object" && !Array.isArray(saved.draft)) {
+        setRepairDraft(saved.draft as Record<string, string>);
+      }
+    } catch {
+      window.sessionStorage.removeItem(CHAT_SESSION_KEY);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!chatPublicKey) {
+      window.sessionStorage.removeItem(CHAT_SESSION_KEY);
+      return;
+    }
+    try {
+      window.sessionStorage.setItem(CHAT_SESSION_KEY, JSON.stringify({
+        publicKey: chatPublicKey,
+        messages: chatMessages.slice(-60),
+        flow: chatFlow,
+        draft: repairDraft
+      }));
+    } catch {
+      // El almacenamiento de sesión puede estar lleno o deshabilitado.
+    }
+  }, [chatPublicKey, chatMessages, chatFlow, repairDraft]);
+
+  useEffect(() => {
+    if (chatOpen && chatPublicKey) chatInputRef.current?.focus();
+  }, [chatOpen, chatPublicKey]);
+
+  useEffect(() => {
+    if (chatOpen) chatEndRef.current?.scrollIntoView({ block: "end" });
+  }, [chatOpen, chatMessages, chatBusy]);
+
   async function updateAssistantRequestStatus(requestId: string, status: string) {
     try {
       await api(`/api/admin/assistant/requests/${requestId}/status`, {
@@ -468,8 +532,8 @@ export default function App() {
   async function convertAssistantRequest(requestId: string) {
     if (!window.confirm("¿Crear una orden real a partir de esta solicitud aprobada?")) return;
     try {
-      const result = await api<{ reference: string }>(`/api/admin/assistant/requests/${requestId}/convert`, { method: "POST" });
-      setAssistantRequests((requests) => requests.map((request) => request.id === requestId ? { ...request, status: "RESUELTA", order_id: result.reference } : request));
+      const result = await api<{ orderId: string; reference: string }>(`/api/admin/assistant/requests/${requestId}/convert`, { method: "POST" });
+      setAssistantRequests((requests) => requests.map((request) => request.id === requestId ? { ...request, status: "RESUELTA", order_id: result.orderId, order_reference: result.reference } : request));
       setMessage(`Solicitud convertida en orden ${result.reference}`);
       await refresh();
     } catch (error) {
@@ -594,25 +658,45 @@ export default function App() {
     }
   }
 
-  async function startChat() {
-    if (chatPublicKey) {
-      setChatOpen(true);
-      return;
-    }
+  function openChat() {
+    setChatOpen(true);
+    if (chatConsent && !chatPublicKey && !chatBusy) void beginConversation();
+  }
+
+  async function beginConversation() {
+    if (chatBusy || chatPublicKey) return;
     setChatBusy(true);
     try {
-      const result = await api<{ publicKey: string; conversationId: string }>("/api/assistant/conversations", {
+      const result = await api<{ publicKey: string; conversationId: string; greeting?: string }>("/api/assistant/conversations", {
         method: "POST",
-        body: JSON.stringify({ consent: false })
+        body: JSON.stringify({ consent: true })
       });
+      window.sessionStorage.setItem(CHAT_CONSENT_KEY, "1");
+      setChatConsent(true);
       setChatPublicKey(result.publicKey);
       setChatConversationId(result.conversationId);
-      setChatOpen(true);
+      setChatMessages([{ role: "assistant", content: result.greeting ?? CHAT_GREETING }]);
+      setChatFlow("IDLE");
+      setRepairDraft({});
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "No se pudo iniciar la asistencia");
     } finally {
       setChatBusy(false);
     }
+  }
+
+  function acceptChatConsent() {
+    if (!consentChecked) return;
+    void beginConversation();
+  }
+
+  function resetChatSession(notice: string) {
+    setChatPublicKey(null);
+    setChatConversationId(null);
+    setChatFlow("IDLE");
+    setRepairDraft({});
+    setChatMessages([{ role: "assistant", content: notice }]);
+    window.sessionStorage.removeItem(CHAT_SESSION_KEY);
   }
 
   async function sendChatMessage(message?: string) {
@@ -628,16 +712,21 @@ export default function App() {
       });
       setChatMessages((messages) => [...messages, { role: "assistant", content: result.reply }]);
     } catch (error) {
-      setChatMessages((messages) => [...messages, {
-        role: "assistant",
-        content: error instanceof Error ? error.message : "No se pudo procesar el mensaje."
-      }]);
+      const errorMessage = error instanceof Error ? error.message : "No se pudo procesar el mensaje.";
+      if (/cerrad|consentimiento/i.test(errorMessage)) {
+        setChatConsent(false);
+        window.sessionStorage.removeItem(CHAT_CONSENT_KEY);
+        resetChatSession("La conversación anterior finalizó. Aceptá nuevamente el consentimiento para iniciar una conversación nueva.");
+      } else {
+        setChatMessages((messages) => [...messages, { role: "assistant", content: errorMessage }]);
+      }
     } finally {
       setChatBusy(false);
     }
   }
 
-  async function beginRepairRequest() {
+  function beginRepairRequest() {
+    if (!chatPublicKey) return;
     setChatFlow("REPAIR");
     setRepairDraft({});
     setChatMessages((messages) => [...messages,
@@ -645,11 +734,21 @@ export default function App() {
     ]);
   }
 
-  async function beginContactRequest() {
+  function beginContactRequest() {
+    if (!chatPublicKey) return;
     setChatFlow("CONTACT");
     setRepairDraft({});
     setChatMessages((messages) => [...messages,
       { role: "assistant", content: "Indicame tu nombre completo." }
+    ]);
+  }
+
+  function beginOrderTracking() {
+    if (!chatPublicKey) return;
+    setChatFlow("TRACK");
+    setRepairDraft({});
+    setChatMessages((messages) => [...messages,
+      { role: "assistant", content: "Para consultar una reparación, ingresá el número de orden (por ejemplo GR-00001)." }
     ]);
   }
 
@@ -689,6 +788,50 @@ export default function App() {
     }]);
   }
 
+  async function handleOrderTracking(message: string) {
+    if (!repairDraft.reference) {
+      setRepairDraft({ reference: message });
+      setChatMessages((messages) => [...messages, { role: "assistant", content: "Ahora ingresá el teléfono registrado en la orden." }]);
+      return;
+    }
+    const reference = repairDraft.reference;
+    setRepairDraft({ ...repairDraft, phone: message });
+    setChatBusy(true);
+    try {
+      const result = await api<{
+        order: {
+          reference: string;
+          equipment: string;
+          status: string;
+          receivedAt: string;
+          nextSteps: string;
+          budgetMinor: number | null;
+        };
+      }>("/api/assistant/orders/track", {
+        method: "POST",
+        body: JSON.stringify({ reference, phone: message })
+      });
+      const lines = [
+        `Orden ${result.order.reference}`,
+        `Equipo: ${result.order.equipment}`,
+        `Estado: ${result.order.status}`,
+        `Recepción: ${new Date(result.order.receivedAt).toLocaleDateString("es-AR")}`,
+        result.order.nextSteps,
+        result.order.budgetMinor !== null ? `Presupuesto registrado: ${formatMoney(result.order.budgetMinor)}` : ""
+      ].filter(Boolean);
+      setChatMessages((messages) => [...messages, { role: "assistant", content: lines.join("\n") }]);
+    } catch (error) {
+      setChatMessages((messages) => [...messages, {
+        role: "assistant",
+        content: `${error instanceof Error ? error.message : "No se pudo consultar la orden"}.\n\nVerificá el número y el teléfono, o volvé a intentarlo con «Consultar estado».`
+      }]);
+    } finally {
+      setChatFlow("IDLE");
+      setRepairDraft({});
+      setChatBusy(false);
+    }
+  }
+
   async function confirmRepairRequest() {
     if (!chatPublicKey) return;
     setChatBusy(true);
@@ -725,11 +868,13 @@ export default function App() {
   }
 
   async function submitChatText() {
+    if (chatBusy) return;
     if (chatFlow === "REPAIR_CONFIRM") {
       const message = chatInput.trim();
+      if (!message) return;
       setChatInput("");
       setChatMessages((messages) => [...messages, { role: "customer", content: message }]);
-      if (/^(sí|si|confirmo|correcto|envialo|acepto)$/i.test(message)) {
+      if (/^(sí|si|confirmo|correcto|envialo|acepto|dale)$/i.test(message)) {
         await confirmRepairRequest();
       } else if (/^(no|cancelar|editar|corregir)$/i.test(message)) {
         setChatFlow("REPAIR");
@@ -746,6 +891,14 @@ export default function App() {
       setChatInput("");
       setChatMessages((messages) => [...messages, { role: "customer", content: message }]);
       await handleChatRepair(message);
+      return;
+    }
+    if (chatFlow === "TRACK") {
+      const message = chatInput.trim();
+      if (!message) return;
+      setChatInput("");
+      setChatMessages((messages) => [...messages, { role: "customer", content: message }]);
+      await handleOrderTracking(message);
       return;
     }
     if (chatFlow === "CONTACT") {
@@ -790,15 +943,21 @@ export default function App() {
   }
 
   async function closeChatConversation() {
-    if (chatPublicKey) {
-      try {
-        await api(`/api/assistant/conversations/${encodeURIComponent(chatPublicKey)}`, { method: "PATCH" });
-      } catch {
-        // El cierre visual también protege la interacción aunque falle la red.
-      }
-    }
+    const publicKey = chatPublicKey;
     setChatOpen(false);
     setChatFlow("IDLE");
+    setRepairDraft({});
+    setChatPublicKey(null);
+    setChatConversationId(null);
+    setChatMessages([{ role: "assistant", content: CHAT_GREETING }]);
+    window.sessionStorage.removeItem(CHAT_SESSION_KEY);
+    if (publicKey) {
+      try {
+        await api(`/api/assistant/conversations/${encodeURIComponent(publicKey)}`, { method: "PATCH" });
+      } catch {
+        // El cierre local también protege la interacción aunque falle la red.
+      }
+    }
   }
 
   async function submitCustomer(event: FormEvent<HTMLFormElement>) {
@@ -1339,40 +1498,79 @@ export default function App() {
         </div>
       )}
       {!chatOpen && (
-        <button className="assistant-fab" type="button" aria-label="Abrir asistencia de Group Repair" onClick={() => void startChat()}>
+        <button className="assistant-fab" type="button" aria-label="Abrir asistencia de Group Repair" onClick={openChat}>
           <span aria-hidden="true">AI</span>
           <small>Asistencia</small>
         </button>
       )}
       {chatOpen && (
-        <aside className="assistant-widget" aria-label="Asistente virtual de Group Repair">
+        <aside
+          className="assistant-widget"
+          aria-label="Asistente virtual de Group Repair"
+          onKeyDown={(event) => { if (event.key === "Escape") void closeChatConversation(); }}
+        >
           <header className="assistant-widget-header">
             <div className="assistant-agent"><span aria-hidden="true">GR</span><div><strong>Asistente Group Repair</strong><small><i /> Disponible · modo informado</small></div></div>
             <button type="button" aria-label="Finalizar conversación" onClick={() => void closeChatConversation()}>×</button>
           </header>
-          <div className="assistant-messages" aria-live="polite">
-            {chatMessages.map((message, index) => (
-              <div className={`assistant-message ${message.role}`} key={`${index}-${message.role}`}>
-                <span>{message.role === "assistant" ? "Asistente" : "Vos"}</span>
-                <p>{message.content}</p>
-              </div>
-            ))}
-            {chatBusy && <div className="assistant-thinking"><span /><span /><span /> Procesando</div>}
-          </div>
-          {chatFlow === "IDLE" && (
-            <div className="assistant-quick-actions">
-              <button type="button" onClick={() => void beginRepairRequest()}>Solicitar reparación</button>
-              <button type="button" onClick={() => void sendChatMessage("Consultar estado de reparación")}>Consultar estado</button>
-              <button type="button" onClick={() => void sendChatMessage("Consultar servicios")}>Consultar servicios</button>
-              <button type="button" onClick={() => void sendChatMessage("Consultar presupuesto")}>Consultar presupuesto</button>
-              <button type="button" onClick={() => void beginContactRequest()}>Hablar con el taller</button>
+          {!chatPublicKey ? (
+            <div className="assistant-consent-gate">
+              {chatBusy ? (
+                <p className="assistant-thinking"><span /><span /><span /> Iniciando conversación segura</p>
+              ) : (
+                <>
+                  <h2>Asistencia del taller</h2>
+                  <p>Este asistente responde consultas sobre servicios, reparaciones y estado de órdenes. Para guardar la conversación y tu solicitud necesitamos tu consentimiento.</p>
+                  <ul>
+                    <li>Usamos nombre, teléfono y descripción del equipo solo para gestionar tu consulta.</li>
+                    <li>La conversación puede procesarse con un proveedor de IA para generar respuestas.</li>
+                    <li>El estado de una orden se consulta con número de orden y teléfono registrado.</li>
+                  </ul>
+                  <label className="assistant-consent-check">
+                    <input type="checkbox" checked={consentChecked} onChange={(event) => setConsentChecked(event.target.checked)} />
+                    Acepto el tratamiento de mis datos para esta consulta.
+                  </label>
+                  <button className="primary" type="button" disabled={!consentChecked} onClick={acceptChatConsent}>Comenzar conversación</button>
+                  <a href="/privacy" target="_blank" rel="noreferrer">Política de privacidad</a>
+                </>
+              )}
             </div>
+          ) : (
+            <>
+              <div className="assistant-messages" aria-live="polite" aria-busy={chatBusy} role="log">
+                {chatMessages.map((message, index) => (
+                  <div className={`assistant-message ${message.role}`} key={`${index}-${message.role}`}>
+                    <span>{message.role === "assistant" ? "Asistente" : "Vos"}</span>
+                    <p>{message.content}</p>
+                  </div>
+                ))}
+                {chatBusy && <div className="assistant-thinking"><span /><span /><span /> Procesando</div>}
+                <div ref={chatEndRef} />
+              </div>
+              {chatFlow === "IDLE" && (
+                <div className="assistant-quick-actions">
+                  <button type="button" onClick={beginRepairRequest}>Solicitar reparación</button>
+                  <button type="button" onClick={beginOrderTracking}>Consultar estado</button>
+                  <button type="button" onClick={() => void sendChatMessage("Consultar servicios")}>Consultar servicios</button>
+                  <button type="button" onClick={() => void sendChatMessage("Consultar presupuesto")}>Consultar presupuesto</button>
+                  <button type="button" onClick={beginContactRequest}>Hablar con el taller</button>
+                </div>
+              )}
+              <form className="assistant-compose" onSubmit={(event) => { event.preventDefault(); void submitChatText(); }}>
+                <input
+                  ref={chatInputRef}
+                  value={chatInput}
+                  onChange={(event) => setChatInput(event.target.value)}
+                  maxLength={2000}
+                  placeholder="Escribí tu consulta..."
+                  aria-label="Mensaje para el asistente"
+                  disabled={chatBusy}
+                />
+                <button type="submit" disabled={chatBusy || !chatInput.trim()} aria-label="Enviar mensaje">Enviar</button>
+              </form>
+              <footer className="assistant-consent">Al enviar, aceptás el tratamiento de la información necesaria para gestionar tu consulta y que pueda procesarse con un proveedor de IA para generar la respuesta.</footer>
+            </>
           )}
-          <form className="assistant-compose" onSubmit={(event) => { event.preventDefault(); void submitChatText(); }}>
-            <input value={chatInput} onChange={(event) => setChatInput(event.target.value)} maxLength={2000} placeholder="Escribí tu consulta..." disabled={chatBusy} />
-            <button type="submit" disabled={chatBusy || !chatInput.trim()} aria-label="Enviar mensaje">Enviar</button>
-          </form>
-          <footer className="assistant-consent">Al enviar, aceptás el tratamiento de la información necesaria para gestionar tu consulta.</footer>
         </aside>
       )}
       <div className="app-shell">
@@ -2008,7 +2206,7 @@ export default function App() {
                           {["NUEVA", "EN REVISION", "ESPERANDO CLIENTE", "DERIVADA", "RESUELTA", "CERRADA"].map((status) => <option key={status} value={status}>{status}</option>)}
                         </select>
                         {request.request_type === "REPAIR" && !request.order_id && <button className="secondary" type="button" onClick={() => convertAssistantRequest(request.id)}>Convertir en orden</button>}
-                        {request.order_id && <small>Orden: {request.order_id}</small>}
+                        {(request.order_reference ?? request.order_id) && <small>Orden: {request.order_reference ?? request.order_id}</small>}
                       </div></td>
                     </tr>
                   ))}
