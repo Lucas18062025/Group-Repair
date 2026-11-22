@@ -72,8 +72,17 @@ interface Order {
   priority: string;
   status: string;
   customer_name: string;
+  customer_phone?: string;
   brand: string;
   model: string;
+  category?: string;
+  serial_number?: string | null;
+  received_at?: string | null;
+  observations?: string | null;
+  accessories?: string | null;
+  reported_fault?: string | null;
+  technician_name?: string | null;
+  total_minor?: number;
   created_at: string;
 }
 
@@ -151,6 +160,7 @@ export default function App() {
   const [adminUsers, setAdminUsers] = useState<AuthUser[]>([]);
   const [googleAccounts, setGoogleAccounts] = useState<GoogleAllowlistAccount[]>([]);
   const [showLoginOverlay, setShowLoginOverlay] = useState(false);
+  const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
 
   function navigateTab(nextTab: Tab) {
     setTab(nextTab);
@@ -462,7 +472,8 @@ export default function App() {
           location: form.get("location"),
           costMinor: Number(form.get("cost")) * 100,
           salePriceMinor: Number(form.get("price")) * 100,
-          minimumStock: Number(form.get("minimum"))
+          minimumStock: Number(form.get("minimum")),
+          initialStock: Number(form.get("initialStock") ?? 0)
         })
       });
       formElement.reset();
@@ -500,7 +511,10 @@ export default function App() {
           deviceId: device.id,
           reportedIssue: form.get("reportedIssue"),
           priority: form.get("priority"),
-          estimatedCompletionAt: form.get("estimated")
+          estimatedCompletionAt: form.get("estimated"),
+          receivedAt: form.get("receivedAt"),
+          observations: form.get("observations"),
+          accessories: form.get("accessories")
         })
       });
       formElement.reset();
@@ -509,6 +523,51 @@ export default function App() {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Error al crear la orden");
       setBusy(false);
+    }
+  }
+
+  async function openOrder(order: Order) {
+    try {
+      const result = await api<{ order: Order }>(`/api/orders/${order.id}`);
+      setSelectedOrder(result.order);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo cargar el detalle");
+    }
+  }
+
+  async function deleteOrder(orderId: string) {
+    if (!window.confirm("¿Eliminar esta orden vacía y sus datos auxiliares?")) return;
+    try {
+      await api(`/api/orders/${orderId}`, { method: "DELETE" });
+      setSelectedOrder(null);
+      setMessage("Orden eliminada");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo eliminar la orden");
+    }
+  }
+
+  async function adjustPart(partId: string, kind: "IN" | "OUT" | "ADJUSTMENT_IN" | "ADJUSTMENT_OUT") {
+    const quantityText = window.prompt("Cantidad a registrar");
+    if (!quantityText) return;
+    const quantity = Number(quantityText);
+    if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+      setMessage("La cantidad debe ser un entero positivo");
+      return;
+    }
+    try {
+      await api(`/api/parts/${partId}/movements`, {
+        method: "POST",
+        body: JSON.stringify({
+          quantity,
+          kind,
+          reason: kind === "OUT" ? "Salida manual de inventario" : "Ajuste manual de stock"
+        })
+      });
+      setMessage("Movimiento de stock registrado");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo ajustar el stock");
     }
   }
 
@@ -683,7 +742,9 @@ export default function App() {
                   <label>Falla reportada<input name="reportedFault" /></label>
                   <label>Accesorios<input name="accessories" /></label>
                   <label>Problema de la orden<input name="reportedIssue" required /></label>
+                  <label>Observaciones<textarea name="observations" rows={3} /></label>
                   <label>Prioridad<select name="priority"><option value="normal">Normal</option><option value="alta">Alta</option><option value="urgente">Urgente</option></select></label>
+                  <label>Fecha de recepción<input name="receivedAt" type="datetime-local" /></label>
                   <label>Entrega estimada<input name="estimated" type="datetime-local" /></label>
                   <button className="primary" type="submit" disabled={busy}>Crear equipo y orden</button>
                 </form>
@@ -696,11 +757,30 @@ export default function App() {
           <section className="content">
             <article className="panel-card">
               <h2>Órdenes de reparación</h2>
-              <div className="table-wrap"><table><thead><tr><th>Referencia</th><th>Cliente</th><th>Equipo</th><th>Estado</th><th>Problema</th></tr></thead><tbody>
-                {orders.map(order => <tr key={order.id}><td><strong>{order.reference}</strong></td><td>{order.customer_name}</td><td>{order.brand} {order.model}</td><td><span className="badge">{statusLabel(order.status)}</span></td><td>{order.reported_issue}</td></tr>)}
+              <div className="table-wrap"><table><thead><tr><th>Número</th><th>Cliente</th><th>Equipo</th><th>Ingreso</th><th>Estado</th><th>Técnico</th><th>Presupuesto</th><th>Acciones</th></tr></thead><tbody>
+                {orders.map(order => <tr key={order.id}><td><strong>{order.reference}</strong></td><td>{order.customer_name}<br /><small>{order.customer_phone ?? ""}</small></td><td>{order.brand} {order.model}{order.serial_number ? ` · ${order.serial_number}` : ""}</td><td>{order.received_at ? new Date(order.received_at).toLocaleString("es-AR") : new Date(order.created_at).toLocaleString("es-AR")}</td><td><span className="badge">{statusLabel(order.status)}</span></td><td>{order.technician_name ?? "Sin asignar"}</td><td>{formatMoney(order.total_minor ?? 0)}</td><td><button className="secondary" type="button" onClick={() => openOrder(order)}>Ver detalle</button></td></tr>)}
               </tbody></table></div>
               {!orders.length && <p className="empty">Todavía no hay órdenes.</p>}
             </article>
+            {selectedOrder && (
+              <article className="panel-card order-detail">
+                <div className="detail-heading">
+                  <h2>Detalle {selectedOrder.reference}</h2>
+                  <button className="secondary" type="button" onClick={() => setSelectedOrder(null)}>Cerrar</button>
+                </div>
+                <dl>
+                  <dt>Cliente</dt><dd>{selectedOrder.customer_name}</dd>
+                  <dt>Equipo</dt><dd>{selectedOrder.category ?? ""} · {selectedOrder.brand} {selectedOrder.model}</dd>
+                  <dt>Serie / IMEI</dt><dd>{selectedOrder.serial_number ?? "No informado"}</dd>
+                  <dt>Falla reportada</dt><dd>{selectedOrder.reported_fault ?? selectedOrder.reported_issue}</dd>
+                  <dt>Observaciones</dt><dd>{selectedOrder.observations ?? "Sin observaciones"}</dd>
+                  <dt>Accesorios</dt><dd>{selectedOrder.accessories ?? "Sin accesorios"}</dd>
+                  <dt>Técnico</dt><dd>{selectedOrder.technician_name ?? "Sin asignar"}</dd>
+                  <dt>Estado</dt><dd>{statusLabel(selectedOrder.status)}</dd>
+                </dl>
+                <button className="danger" type="button" onClick={() => deleteOrder(selectedOrder.id)}>Eliminar registro vacío</button>
+              </article>
+            )}
           </section>
         )}
 
@@ -714,14 +794,15 @@ export default function App() {
                 <label>Ubicación<input name="location" /></label>
                 <label>Costo ($)<input name="cost" type="number" min="0" step="0.01" required /></label>
                 <label>Precio ($)<input name="price" type="number" min="0" step="0.01" required /></label>
+                <label>Stock inicial<input name="initialStock" type="number" min="0" step="1" defaultValue="0" required /></label>
                 <label>Stock mínimo<input name="minimum" type="number" min="0" defaultValue="0" required /></label>
                 <button className="primary" type="submit" disabled={busy}>Guardar repuesto</button>
               </form>
             </article>
             <article className="panel-card">
               <h2>Existencias</h2>
-              <div className="table-wrap"><table><thead><tr><th>SKU</th><th>Repuesto</th><th>Stock</th><th>Precio</th></tr></thead><tbody>
-                {parts.map(part => <tr key={part.id}><td>{part.sku}</td><td>{part.name}</td><td>{part.stock}</td><td>{formatMoney(part.sale_price_minor)}</td></tr>)}
+              <div className="table-wrap"><table><thead><tr><th>SKU</th><th>Repuesto</th><th>Stock</th><th>Precio</th><th>Acciones</th></tr></thead><tbody>
+                {parts.map(part => <tr key={part.id}><td>{part.sku}</td><td>{part.name}</td><td><strong>{part.stock}</strong></td><td>{formatMoney(part.sale_price_minor)}</td><td><div className="row-actions"><button className="secondary" type="button" onClick={() => adjustPart(part.id, "IN")}>Entrada</button><button className="secondary" type="button" onClick={() => adjustPart(part.id, "OUT")}>Salida</button></div></td></tr>)}
               </tbody></table></div>
             </article>
           </section>

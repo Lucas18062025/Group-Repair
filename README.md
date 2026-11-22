@@ -20,6 +20,12 @@ La aplicación incluye un panel operativo y secciones para clientes, equipos, ó
 El acceso al panel y a las operaciones generales de negocio está habilitado sin login obligatorio. Las funciones administrativas, la gestión de cuentas Google autorizadas y las credenciales OAuth permanecen protegidas por sesión aprobada.
 
 Mientras el modo público esté activo, terceros pueden utilizar las operaciones generales disponibles desde la aplicación. No se debe usar con datos reales de clientes hasta que se habilite la separación multiusuario y se revisen los permisos del taller. Los secretos de Google, Gemini y Cloudflare no se exponen al frontend.
+
+## Órdenes e inventario
+
+Las órdenes muestran detalle completo, relación con cliente/equipo, recepción, observaciones, accesorios, estado, técnico y presupuesto. Los registros vacíos pueden corregirse o eliminarse con protección; una orden con historial asociado no se elimina para preservar trazabilidad.
+
+El stock se calcula exclusivamente desde movimientos de inventario. Al crear un repuesto puede registrarse el stock inicial como movimiento `IN`; las entradas y salidas posteriores se registran como movimientos trazables. Los repuestos existentes sin movimientos conservan el stock calculado disponible y no reciben cantidades inventadas automáticamente.
 ## Despliegue (Cloudflare)
 
 La aplicación está desplegada en Cloudflare Workers: [https://group-repair.lucaslean1806.workers.dev/](https://group-repair.lucaslean1806.workers.dev/).

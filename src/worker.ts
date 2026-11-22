@@ -1,4 +1,4 @@
-import { canTransition, type OrderStatus } from "./domain/status";
+import { canTransition, ORDER_STATUSES, type OrderStatus } from "./domain/status";
 import { calculateLineTotal } from "./domain/money";
 import {
   clearSessionCookie,
@@ -712,10 +712,15 @@ export default {
       if (url.pathname === "/api/orders" && request.method === "GET") {
         const result = await env.DB.prepare(`
           SELECT ro.id,ro.reference,ro.reported_issue,ro.priority,ro.status,ro.created_at,
-                 c.name AS customer_name,d.brand,d.model
+                 ro.received_at,ro.observations,ro.accessories,ro.assigned_user_id,
+                 c.id AS customer_id,c.name AS customer_name,c.phone AS customer_phone,
+                 d.id AS device_id,d.category,d.brand,d.model,d.serial_number,d.physical_condition,d.reported_fault,
+                 u.name AS technician_name,
+                 COALESCE((SELECT q.total_minor FROM quote_versions q WHERE q.order_id=ro.id AND q.workshop_id=?1 ORDER BY q.version DESC LIMIT 1),0) AS total_minor
           FROM repair_orders ro
           JOIN customers c ON c.id=ro.customer_id
           JOIN devices d ON d.id=ro.device_id
+          LEFT JOIN users u ON u.id=ro.assigned_user_id
           WHERE ro.workshop_id=?1 ORDER BY ro.created_at DESC LIMIT 100
         `).bind(WORKSHOP_ID).all();
         return json({ orders: result.results });
@@ -725,18 +730,133 @@ export default {
         const body = await readJson(request);
         const id = uuid();
         const timestamp = now();
-        const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM repair_orders WHERE workshop_id=?1").bind(WORKSHOP_ID).first<{ count: number }>("count");
-        const reference = `GR-${String((count?.count ?? 0) + 1).padStart(5, "0")}`;
+        const customerId = text(body.customerId, "Cliente");
+        const deviceId = text(body.deviceId, "Equipo");
+        const customer = await env.DB.prepare(
+          "SELECT id FROM customers WHERE id=?1 AND workshop_id=?2"
+        ).bind(customerId, WORKSHOP_ID).first("id");
+        const device = await env.DB.prepare(
+          "SELECT id FROM devices WHERE id=?1 AND customer_id=?2 AND workshop_id=?3"
+        ).bind(deviceId, customerId, WORKSHOP_ID).first("id");
+        if (!customer || !device) return json({ error: "Cliente o equipo no válido" }, 400);
+        const lastReference = await env.DB.prepare(`
+          SELECT CAST(SUBSTR(reference,4) AS INTEGER) AS number
+          FROM repair_orders WHERE workshop_id=?1
+          ORDER BY CAST(SUBSTR(reference,4) AS INTEGER) DESC LIMIT 1
+        `).bind(WORKSHOP_ID).first<{ number: number }>();
+        const reference = `GR-${String((lastReference?.number ?? 0) + 1).padStart(5, "0")}`;
+        const status = body.status ? text(body.status, "Estado").toUpperCase() : "RECEIVED";
+        if (!(ORDER_STATUSES as readonly string[]).includes(status)) return json({ error: "Estado inicial no válido" }, 400);
+        if (status !== "RECEIVED") return json({ error: "La orden debe iniciar en estado Recibida" }, 400);
+        const receivedAt = body.receivedAt ? text(body.receivedAt, "Fecha de recepción") : timestamp;
         await env.DB.batch([
           env.DB.prepare(
-            "INSERT INTO repair_orders (id,workshop_id,customer_id,device_id,reference,reported_issue,priority,status,estimated_completion_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"
-          ).bind(id, WORKSHOP_ID, text(body.customerId, "Cliente"), text(body.deviceId, "Equipo"), reference, text(body.reportedIssue, "Problema"), body.priority ? text(body.priority, "Prioridad") : "normal", "RECEIVED", body.estimatedCompletionAt ? text(body.estimatedCompletionAt, "Fecha estimada") : null, timestamp, timestamp),
+            "INSERT INTO repair_orders (id,workshop_id,customer_id,device_id,reference,reported_issue,priority,status,estimated_completion_at,received_at,observations,accessories,assigned_user_id,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"
+          ).bind(
+            id, WORKSHOP_ID, customerId, deviceId, reference,
+            text(body.reportedIssue, "Problema"),
+            body.priority ? text(body.priority, "Prioridad") : "normal",
+            "RECEIVED",
+            body.estimatedCompletionAt ? text(body.estimatedCompletionAt, "Fecha estimada") : null,
+            receivedAt,
+            body.observations ? text(body.observations, "Observaciones") : null,
+            body.accessories ? text(body.accessories, "Accesorios") : null,
+            body.assignedUserId ? text(body.assignedUserId, "Técnico") : null,
+            timestamp, timestamp
+          ),
           env.DB.prepare(
             "INSERT INTO order_status_events (id,workshop_id,order_id,from_status,to_status,actor_id,reason,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
           ).bind(uuid(), WORKSHOP_ID, id, null, "RECEIVED", null, "Orden creada", timestamp)
         ]);
         await audit(env.DB, "order.created", "repair_order", id, { reference });
         return json({ id, reference }, 201);
+      }
+
+      const orderDetailMatch = url.pathname.match(/^\/api\/orders\/([^/]+)$/);
+      if (orderDetailMatch && request.method === "GET") {
+        const orderId = orderDetailMatch[1];
+        const order = await env.DB.prepare(`
+          SELECT ro.*,c.name AS customer_name,c.phone AS customer_phone,c.email AS customer_email,
+                 d.category,d.brand,d.model,d.serial_number,d.physical_condition,d.reported_fault,d.accessories AS device_accessories,
+                 u.name AS technician_name
+          FROM repair_orders ro
+          JOIN customers c ON c.id=ro.customer_id
+          JOIN devices d ON d.id=ro.device_id
+          LEFT JOIN users u ON u.id=ro.assigned_user_id
+          WHERE ro.id=?1 AND ro.workshop_id=?2
+        `).bind(orderId, WORKSHOP_ID).first();
+        if (!order) return json({ error: "Orden no encontrada" }, 404);
+        const [events, diagnostics, quotes] = await Promise.all([
+          env.DB.prepare("SELECT * FROM order_status_events WHERE order_id=?1 AND workshop_id=?2 ORDER BY created_at DESC").bind(orderId, WORKSHOP_ID).all(),
+          env.DB.prepare("SELECT * FROM diagnostics WHERE order_id=?1 AND workshop_id=?2 ORDER BY created_at DESC").bind(orderId, WORKSHOP_ID).all(),
+          env.DB.prepare("SELECT id,version,subtotal_minor,tax_minor,total_minor,status,expires_at,created_at FROM quote_versions WHERE order_id=?1 AND workshop_id=?2 ORDER BY version DESC").bind(orderId, WORKSHOP_ID).all()
+        ]);
+        return json({ order, events: events.results, diagnostics: diagnostics.results, quotes: quotes.results });
+      }
+
+      if (orderDetailMatch && request.method === "PATCH") {
+        const orderId = orderDetailMatch[1];
+        const body = await readJson(request);
+        const order = await env.DB.prepare(
+          "SELECT id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first("id");
+        if (!order) return json({ error: "Orden no encontrada" }, 404);
+        await env.DB.batch([
+          env.DB.prepare(`
+            UPDATE repair_orders SET
+              reported_issue=?1,priority=?2,estimated_completion_at=?3,received_at=?4,
+              observations=?5,accessories=?6,assigned_user_id=?7,updated_at=?8
+            WHERE id=?9 AND workshop_id=?10
+          `).bind(
+            text(body.reportedIssue, "Problema"),
+            body.priority ? text(body.priority, "Prioridad") : "normal",
+            body.estimatedCompletionAt ? text(body.estimatedCompletionAt, "Fecha estimada") : null,
+            body.receivedAt ? text(body.receivedAt, "Fecha de recepción") : now(),
+            body.observations ? text(body.observations, "Observaciones") : null,
+            body.accessories ? text(body.accessories, "Accesorios") : null,
+            body.assignedUserId ? text(body.assignedUserId, "Técnico") : null,
+            now(), orderId, WORKSHOP_ID
+          ),
+          env.DB.prepare(
+            "UPDATE devices SET category=?1,brand=?2,model=?3,serial_number=?4,physical_condition=?5,reported_fault=?6,accessories=?7 WHERE id=(SELECT device_id FROM repair_orders WHERE id=?8 AND workshop_id=?9)"
+          ).bind(
+            text(body.category, "Categoría"),
+            text(body.brand, "Marca"),
+            text(body.model, "Modelo"),
+            body.serialNumber ? text(body.serialNumber, "Serie/IMEI") : null,
+            body.physicalCondition ? text(body.physicalCondition, "Condición física") : null,
+            body.reportedFault ? text(body.reportedFault, "Falla reportada") : null,
+            body.accessories ? text(body.accessories, "Accesorios") : null,
+            orderId, WORKSHOP_ID
+          )
+        ]);
+        await audit(env.DB, "order.updated", "repair_order", orderId, { corrected: true });
+        return json({ ok: true });
+      }
+
+      if (orderDetailMatch && request.method === "DELETE") {
+        const orderId = orderDetailMatch[1];
+        const order = await env.DB.prepare(
+          "SELECT id,device_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first<{ id: string; device_id: string }>();
+        if (!order) return json({ error: "Orden no encontrada" }, 404);
+        const dependencies = await env.DB.prepare(`
+          SELECT
+            (SELECT COUNT(*) FROM diagnostics WHERE order_id=?1) +
+            (SELECT COUNT(*) FROM quote_versions WHERE order_id=?1) +
+            (SELECT COUNT(*) FROM payment_transactions WHERE order_id=?1) +
+            (SELECT COUNT(*) FROM stock_movements WHERE order_id=?1) AS count
+        `).bind(orderId).first<{ count: number }>();
+        if ((dependencies?.count ?? 0) > 0) {
+          return json({ error: "No se puede eliminar: la orden tiene historial o registros asociados. Cancelala para conservar trazabilidad." }, 409);
+        }
+        await env.DB.batch([
+          env.DB.prepare("DELETE FROM order_status_events WHERE order_id=?1 AND workshop_id=?2").bind(orderId, WORKSHOP_ID),
+          env.DB.prepare("DELETE FROM repair_orders WHERE id=?1 AND workshop_id=?2").bind(orderId, WORKSHOP_ID),
+          env.DB.prepare("DELETE FROM devices WHERE id=?1 AND workshop_id=?2 AND NOT EXISTS (SELECT 1 FROM repair_orders WHERE device_id=?1)").bind(order.device_id, WORKSHOP_ID)
+        ]);
+        await audit(env.DB, "order.deleted", "repair_order", orderId, { duplicateCorrection: true });
+        return json({ ok: true });
       }
 
       const statusMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/status$/);
@@ -841,10 +961,23 @@ export default {
       if (url.pathname === "/api/parts" && request.method === "POST") {
         const body = await readJson(request);
         const id = uuid();
-        await env.DB.prepare(
-          "INSERT INTO parts (id,workshop_id,sku,name,location,cost_minor,sale_price_minor,minimum_stock,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
-        ).bind(id, WORKSHOP_ID, text(body.sku, "SKU"), text(body.name, "Nombre"), body.location ? text(body.location, "Ubicación") : null, integer(body.costMinor, "Costo"), integer(body.salePriceMinor, "Precio"), integer(body.minimumStock ?? 0, "Stock mínimo"), now()).run();
-        await audit(env.DB, "part.created", "part", id);
+        const timestamp = now();
+        const initialStock = integer(body.initialStock ?? 0, "Stock inicial");
+        if (initialStock < 0) throw new Error("El stock inicial no puede ser negativo");
+        const statements = [
+          env.DB.prepare(
+            "INSERT INTO parts (id,workshop_id,sku,name,location,cost_minor,sale_price_minor,minimum_stock,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
+          ).bind(id, WORKSHOP_ID, text(body.sku, "SKU"), text(body.name, "Nombre"), body.location ? text(body.location, "Ubicación") : null, integer(body.costMinor, "Costo"), integer(body.salePriceMinor, "Precio"), integer(body.minimumStock ?? 0, "Stock mínimo"), timestamp)
+        ];
+        if (initialStock > 0) {
+          statements.push(
+            env.DB.prepare(
+              "INSERT INTO stock_movements (id,workshop_id,part_id,order_id,kind,quantity,reason,actor_id,created_at) VALUES (?1,?2,?3,NULL,'IN',?4,'Stock inicial registrado',NULL,?5)"
+            ).bind(uuid(), WORKSHOP_ID, id, initialStock, timestamp)
+          );
+        }
+        await env.DB.batch(statements);
+        await audit(env.DB, "part.created", "part", id, { initialStock });
         return json({ id }, 201);
       }
 
@@ -871,6 +1004,46 @@ export default {
         ).bind(id, WORKSHOP_ID, partId, body.orderId ? text(body.orderId, "Orden") : null, kind, quantity, text(body.reason, "Motivo"), null, now()).run();
         await audit(env.DB, "stock.movement", "stock_movement", id, { kind, quantity });
         return json({ id }, 201);
+      }
+
+      const partDetailMatch = url.pathname.match(/^\/api\/parts\/([^/]+)$/);
+      if (partDetailMatch && request.method === "PATCH") {
+        const partId = partDetailMatch[1];
+        const body = await readJson(request);
+        const part = await env.DB.prepare(
+          "SELECT id FROM parts WHERE id=?1 AND workshop_id=?2"
+        ).bind(partId, WORKSHOP_ID).first("id");
+        if (!part) return json({ error: "Repuesto no encontrado" }, 404);
+        await env.DB.prepare(`
+          UPDATE parts SET
+            sku=?1,name=?2,location=?3,cost_minor=?4,sale_price_minor=?5,minimum_stock=?6
+          WHERE id=?7 AND workshop_id=?8
+        `).bind(
+          text(body.sku, "SKU"),
+          text(body.name, "Nombre"),
+          body.location ? text(body.location, "Ubicación") : null,
+          integer(body.costMinor, "Costo"),
+          integer(body.salePriceMinor, "Precio"),
+          integer(body.minimumStock ?? 0, "Stock mínimo"),
+          partId, WORKSHOP_ID
+        ).run();
+        await audit(env.DB, "part.updated", "part", partId);
+        return json({ ok: true });
+      }
+
+      if (partDetailMatch && request.method === "DELETE") {
+        const partId = partDetailMatch[1];
+        const movements = await env.DB.prepare(
+          "SELECT COUNT(*) AS count FROM stock_movements WHERE part_id=?1 AND workshop_id=?2"
+        ).bind(partId, WORKSHOP_ID).first<number>("count");
+        if ((movements ?? 0) > 0) {
+          return json({ error: "No se puede eliminar: el repuesto tiene movimientos de stock registrados." }, 409);
+        }
+        const deleted = await env.DB.prepare(
+          "DELETE FROM parts WHERE id=?1 AND workshop_id=?2"
+        ).bind(partId, WORKSHOP_ID).run();
+        await audit(env.DB, "part.deleted", "part", partId);
+        return json({ ok: true, deleted: Boolean(deleted) });
       }
 
       if (url.pathname.startsWith("/api/")) {
