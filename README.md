@@ -15,34 +15,6 @@ Group Repair es una aplicación web para gestionar las operaciones de un taller 
 
 La aplicación incluye un panel operativo y secciones para clientes, equipos, órdenes e inventario. El Worker expone operaciones de API para la gestión del taller, con validaciones de dominio, registro de eventos y persistencia en D1. La disponibilidad de servicios externos —por ejemplo, Google o Gemini— depende de la configuración de credenciales y APIs correspondientes.
 
-## Desarrollo local
-
-### Requisitos
-
-- Node.js 22 o compatible.
-- npm.
-- Wrangler y acceso a Cloudflare D1 para tareas que requieran la base de datos remota o el despliegue.
-
-### Instalación y comandos
-
-```bash
-npm install
-npm run cf:types
-npm run cf:migrate
-npm run dev
-```
-
-Verificaciones y compilación:
-
-```bash
-npm test
-npm run typecheck
-npm run build
-npx wrangler deploy --dry-run
-```
-
-La configuración de Cloudflare se encuentra en [`wrangler.jsonc`](wrangler.jsonc) y las migraciones versionadas en [`migrations/`](migrations/). Revisá la configuración del entorno antes de aplicar migraciones o desplegar; no incluyas secretos ni datos reales en el repositorio.
-
 ## Despliegue (Cloudflare)
 
 La aplicación está desplegada en Cloudflare Workers: [https://group-repair.lucaslean1806.workers.dev/](https://group-repair.lucaslean1806.workers.dev/).
