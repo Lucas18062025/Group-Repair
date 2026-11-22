@@ -4,6 +4,20 @@ import { createPublicReference, isValidEmail, isValidPhone, phonesMatch } from "
 import { parseDateTimeLocalToUtcIso } from "./domain/dates";
 import { determineCustomerDeletionAction } from "./domain/customer";
 import {
+  generateR2StorageKey,
+  isValidCategory,
+  MAX_PHOTO_SIZE_BYTES,
+  sanitizeFileName,
+  validateImageSignature
+} from "./domain/attachments";
+import {
+  deserializeOAuthState,
+  GOOGLE_DRIVE_SCOPES,
+  type GoogleConnectionType,
+  isTokenExpired,
+  serializeOAuthState
+} from "./domain/google-drive";
+import {
   clearSessionCookie,
   decryptSecret,
   encryptSecret,
@@ -31,9 +45,30 @@ interface AssetBinding {
   fetch(request: Request): Promise<Response>;
 }
 
+interface R2ObjectBody {
+  body: ReadableStream;
+  size: number;
+  httpMetadata?: {
+    contentType?: string;
+    contentDisposition?: string;
+  };
+  customMetadata?: Record<string, string>;
+  writeHttpMetadata?(headers: Headers): void;
+}
+
+interface R2Bucket {
+  put(key: string, value: ReadableStream | ArrayBuffer | ArrayBufferView | string | null | Blob, options?: {
+    httpMetadata?: { contentType?: string; contentDisposition?: string };
+    customMetadata?: Record<string, string>;
+  }): Promise<unknown>;
+  get(key: string): Promise<R2ObjectBody | null>;
+  delete(key: string | string[]): Promise<void>;
+}
+
 interface Env {
   DB: D1Database;
   ASSETS: AssetBinding;
+  FILES?: R2Bucket;
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
   GOOGLE_REDIRECT_URI?: string;
@@ -226,6 +261,14 @@ function ownsOrCanAdmin(session: SessionUser | null, ownerUserId: string | null)
   return ownerUserId !== null && ownerUserId === session.id;
 }
 
+function canAccessOrder(session: SessionUser | null, order: { owner_user_id?: string | null; assigned_user_id?: string | null; created_by?: string | null }): boolean {
+  if (!session) return false;
+  if (["admin", "technical_lead"].includes(session.role)) return true;
+  return (order.assigned_user_id !== null && order.assigned_user_id !== undefined && order.assigned_user_id === session.id) ||
+         (order.owner_user_id !== null && order.owner_user_id !== undefined && order.owner_user_id === session.id) ||
+         (order.created_by !== null && order.created_by !== undefined && order.created_by === session.id);
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
@@ -248,7 +291,7 @@ export default {
         return json({
           googleConfigured: Boolean(env.GOOGLE_CLIENT_ID),
           googleClientId: env.GOOGLE_CLIENT_ID ?? null,
-          geminiConfigured: Boolean(env.GEMINI_API_KEY)
+          r2Configured: Boolean(env.FILES)
         });
       }
 
@@ -555,67 +598,145 @@ export default {
         return json({ ok: true });
       }
 
-      if (url.pathname === "/api/integrations" && request.method === "GET") {
-        if (!authenticatedSession) return json({ connections: [] });
-        const connections = await env.DB.prepare(
-          "SELECT service,account_email,status,scopes,expires_at,connected_at,last_sync_at,error,updated_at FROM google_connections WHERE user_id=?1"
-        ).bind(authenticatedSession.id).all();
-        return json({ connections: connections.results });
+      // --- Google Drive Integration Endpoints ---
+      if (url.pathname === "/api/integrations/google/status" && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "No autenticado" }, 401);
+
+        const workshopConn = await env.DB.prepare(`
+          SELECT id, service, account_email, status, connection_type, connected_at, expires_at, updated_at
+          FROM google_connections
+          WHERE workshop_id=?1 AND connection_type='WORKSHOP' AND status='connected'
+          LIMIT 1
+        `).bind(WORKSHOP_ID).first<{
+          id: string;
+          service: string;
+          account_email: string | null;
+          status: string;
+          connection_type: string;
+          connected_at: string | null;
+          expires_at: string | null;
+          updated_at: string;
+        }>();
+
+        const personalConn = await env.DB.prepare(`
+          SELECT id, service, account_email, status, connection_type, connected_at, expires_at, updated_at
+          FROM google_connections
+          WHERE user_id=?1 AND connection_type='PERSONAL' AND status='connected'
+          LIMIT 1
+        `).bind(authenticatedSession.id).first<{
+          id: string;
+          service: string;
+          account_email: string | null;
+          status: string;
+          connection_type: string;
+          connected_at: string | null;
+          expires_at: string | null;
+          updated_at: string;
+        }>();
+
+        return json({
+          googleConfigured: Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET),
+          r2Configured: Boolean(env.FILES),
+          workshop: workshopConn ? {
+            connected: true,
+            email: workshopConn.account_email,
+            connectedAt: workshopConn.connected_at
+          } : { connected: false },
+          personal: personalConn ? {
+            connected: true,
+            email: personalConn.account_email,
+            connectedAt: personalConn.connected_at
+          } : { connected: false }
+        });
       }
 
-      const integrationStart = url.pathname.match(/^\/api\/integrations\/(google_drive|google_sheets|google_photos)\/start$/);
-      if (integrationStart && request.method === "POST") {
-        if (!authenticatedSession) return json({ error: "Iniciá sesión con Google para autorizar esta integración" }, 401);
-        const service = integrationStart[1];
+      if (url.pathname === "/api/integrations/google/connect" && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Iniciá sesión para autorizar Google Drive" }, 401);
+        const body = await readJson(request) as { connectionType?: string };
+        const connectionType = (body.connectionType === "WORKSHOP" ? "WORKSHOP" : "PERSONAL") as GoogleConnectionType;
+
+        if (connectionType === "WORKSHOP" && authenticatedSession.role !== "admin") {
+          return json({ error: "Solo los administradores pueden conectar el Google Drive del taller" }, 403);
+        }
+
         if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
           return json({ error: "Google OAuth no está configurado. Pendiente de credenciales externas." }, 503);
         }
-        const scopes: Record<string, string[]> = {
-          google_drive: ["https://www.googleapis.com/auth/drive.file"],
-          google_sheets: ["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/spreadsheets"],
-          google_photos: ["https://www.googleapis.com/auth/photospicker.mediaitems.readonly"]
-        };
-        const state = randomToken(24);
+
         const verifier = randomToken(64);
         const challenge = await sha256(verifier);
         const redirectUri = env.GOOGLE_REDIRECT_URI ?? `${url.origin}/api/auth/callback/google`;
+        const csrf = randomToken(24);
+        const state = serializeOAuthState({
+          csrfToken: csrf,
+          userId: authenticatedSession.id,
+          connectionType,
+          workshopId: WORKSHOP_ID,
+          timestamp: Date.now()
+        });
+
         await env.DB.prepare(
           "INSERT INTO oauth_states (id,state,pkce_verifier_hash,pkce_verifier,user_id,service,redirect_uri,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
-        ).bind(uuid(), state, challenge, verifier, authenticatedSession.id, service, redirectUri, new Date(Date.now() + 10 * 60 * 1000).toISOString(), now()).run();
+        ).bind(
+          uuid(),
+          state,
+          challenge,
+          verifier,
+          authenticatedSession.id,
+          connectionType === "WORKSHOP" ? "google_drive_workshop" : "google_drive_personal",
+          redirectUri,
+          new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+          now()
+        ).run();
 
         const authUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
         authUrl.searchParams.set("client_id", env.GOOGLE_CLIENT_ID);
         authUrl.searchParams.set("redirect_uri", redirectUri);
         authUrl.searchParams.set("response_type", "code");
-        authUrl.searchParams.set("scope", scopes[service].join(" "));
+        authUrl.searchParams.set("scope", GOOGLE_DRIVE_SCOPES.join(" "));
         authUrl.searchParams.set("include_granted_scopes", "true");
         authUrl.searchParams.set("access_type", "offline");
         authUrl.searchParams.set("prompt", "consent");
         authUrl.searchParams.set("state", state);
         authUrl.searchParams.set("code_challenge", challenge);
         authUrl.searchParams.set("code_challenge_method", "S256");
+
         return json({ authUrl: authUrl.toString() });
       }
 
       if (url.pathname === "/api/auth/callback/google" && request.method === "GET") {
         if (!authenticatedSession) {
-          return new Response(null, { status: 302, headers: { location: "/?tab=integraciones&integration_error=auth_required" } });
+          return new Response(null, { status: 302, headers: { location: "/?google_error=auth_required" } });
         }
         const state = url.searchParams.get("state");
         const code = url.searchParams.get("code");
         const oauthError = url.searchParams.get("error");
-        if (oauthError) return new Response(null, { status: 302, headers: { location: "/?integration_error=google&tab=integraciones" } });
+        if (oauthError) return new Response(null, { status: 302, headers: { location: "/?google_error=consent_declined" } });
         if (!state || !code) return json({ error: "Respuesta OAuth incompleta" }, 400);
+
+        const parsedState = deserializeOAuthState(state);
+        if (!parsedState) return json({ error: "Estado OAuth manipulado o inválido" }, 400);
+
         const record = await env.DB.prepare(`
           SELECT state,user_id,service,redirect_uri,pkce_verifier,expires_at,used_at
           FROM oauth_states WHERE state=?1
-        `).bind(state).first<{ state: string; user_id: string; service: string; redirect_uri: string; pkce_verifier: string; expires_at: string; used_at: string | null }>();
+        `).bind(state).first<{
+          state: string;
+          user_id: string;
+          service: string;
+          redirect_uri: string;
+          pkce_verifier: string;
+          expires_at: string;
+          used_at: string | null;
+        }>();
+
         if (!record || record.used_at || record.expires_at <= now() || record.user_id !== authenticatedSession.id) {
           return json({ error: "Estado OAuth inválido o expirado" }, 401);
         }
         if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
           return json({ error: "Google OAuth no está configurado" }, 503);
         }
+
         await env.DB.prepare("UPDATE oauth_states SET used_at=?1 WHERE state=?2").bind(now(), state).run();
 
         const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
@@ -630,6 +751,7 @@ export default {
             code_verifier: record.pkce_verifier
           })
         });
+
         const tokenBody = await tokenResponse.json() as {
           access_token?: string;
           refresh_token?: string;
@@ -637,115 +759,473 @@ export default {
           scope?: string;
           error?: string;
         };
+
         if (!tokenResponse.ok || !tokenBody.access_token) {
-          return json({ error: tokenBody.error ?? "No se pudieron intercambiar las credenciales" }, 502);
+          return json({ error: tokenBody.error ?? "No se pudieron intercambiar las credenciales con Google" }, 502);
         }
+
         if (!env.OAUTH_TOKEN_ENCRYPTION_KEY) {
           return json({ error: "Falta la clave de cifrado de tokens OAuth" }, 503);
         }
+
+        let accountEmail: string | null = null;
+        try {
+          const userInfoRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+            headers: { Authorization: `Bearer ${tokenBody.access_token}` }
+          });
+          if (userInfoRes.ok) {
+            const uInfo = await userInfoRes.json() as { email?: string };
+            accountEmail = uInfo.email ?? null;
+          }
+        } catch {
+          // Continuar si falla la lectura de perfil
+        }
+
         const accessEncrypted = await encryptSecret(tokenBody.access_token, env.OAUTH_TOKEN_ENCRYPTION_KEY);
         const refreshEncrypted = tokenBody.refresh_token
           ? await encryptSecret(tokenBody.refresh_token, env.OAUTH_TOKEN_ENCRYPTION_KEY)
           : null;
         const expiresAt = new Date(Date.now() + (tokenBody.expires_in ?? 3600) * 1000).toISOString();
+        const connType = parsedState.connectionType;
+        const service = connType === "WORKSHOP" ? "google_drive_workshop" : "google_drive_personal";
+
         await env.DB.prepare(`
-          INSERT INTO google_connections (id,user_id,service,status,access_token_encrypted,refresh_token_encrypted,scopes,expires_at,connected_at,created_at,updated_at)
-          VALUES (?1,?2,?3,'connected',?4,?5,?6,?7,?8,?9,?10)
-          ON CONFLICT(user_id,service) DO UPDATE SET
-            status='connected',access_token_encrypted=excluded.access_token_encrypted,
-            refresh_token_encrypted=COALESCE(excluded.refresh_token_encrypted,google_connections.refresh_token_encrypted),
-            scopes=excluded.scopes,expires_at=excluded.expires_at,connected_at=excluded.connected_at,
-            error=NULL,updated_at=excluded.updated_at
+          INSERT INTO google_connections (
+            id, user_id, service, account_email, status, access_token_encrypted,
+            refresh_token_encrypted, scopes, expires_at, connected_at, workshop_id,
+            connection_type, created_at, updated_at
+          )
+          VALUES (?1, ?2, ?3, ?4, 'connected', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+          ON CONFLICT(user_id, service) DO UPDATE SET
+            status='connected',
+            account_email=COALESCE(excluded.account_email, google_connections.account_email),
+            access_token_encrypted=excluded.access_token_encrypted,
+            refresh_token_encrypted=COALESCE(excluded.refresh_token_encrypted, google_connections.refresh_token_encrypted),
+            scopes=excluded.scopes,
+            expires_at=excluded.expires_at,
+            connected_at=excluded.connected_at,
+            workshop_id=excluded.workshop_id,
+            connection_type=excluded.connection_type,
+            revoked_at=NULL,
+            error=NULL,
+            updated_at=excluded.updated_at
         `).bind(
-          uuid(), authenticatedSession.id, record.service, accessEncrypted, refreshEncrypted,
-          tokenBody.scope ?? null, expiresAt, now(), now(), now()
+          uuid(),
+          authenticatedSession.id,
+          service,
+          accountEmail,
+          accessEncrypted,
+          refreshEncrypted,
+          tokenBody.scope ?? GOOGLE_DRIVE_SCOPES.join(" "),
+          expiresAt,
+          now(),
+          WORKSHOP_ID,
+          connType,
+          now(),
+          now()
         ).run();
-        await audit(env.DB, "integration.connected", "integration", authenticatedSession.id, { service: record.service });
-        return new Response(null, { status: 302, headers: { location: `/?tab=integraciones&connected=${encodeURIComponent(record.service)}` } });
+
+        await audit(env.DB, "google_drive.connected", "integration", authenticatedSession.id, {
+          connectionType: connType,
+          email: accountEmail
+        });
+
+        return new Response(null, {
+          status: 302,
+          headers: { location: `/?google_connected=${connType.toLowerCase()}` }
+        });
       }
 
-      const integrationDisconnect = url.pathname.match(/^\/api\/integrations\/(google_drive|google_sheets|google_photos)\/disconnect$/);
-      if (integrationDisconnect && request.method === "POST") {
-        if (!authenticatedSession) return json({ error: "Iniciá sesión con Google para administrar esta integración" }, 401);
-        const service = integrationDisconnect[1];
-        await env.DB.prepare(
-          "UPDATE google_connections SET status='disconnected',access_token_encrypted=NULL,refresh_token_encrypted=NULL,error=NULL,updated_at=?1 WHERE user_id=?2 AND service=?3"
-        ).bind(now(), authenticatedSession.id, service).run();
-        await audit(env.DB, "integration.disconnected", "integration", authenticatedSession.id, { service });
+      if (url.pathname === "/api/integrations/google/disconnect" && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        const body = await readJson(request) as { connectionType?: string };
+        const connectionType = body.connectionType === "WORKSHOP" ? "WORKSHOP" : "PERSONAL";
+
+        if (connectionType === "WORKSHOP" && authenticatedSession.role !== "admin") {
+          return json({ error: "Solo los administradores pueden desconectar el Google Drive del taller" }, 403);
+        }
+
+        if (connectionType === "WORKSHOP") {
+          await env.DB.prepare(`
+            UPDATE google_connections
+            SET status='disconnected', access_token_encrypted=NULL, refresh_token_encrypted=NULL,
+                revoked_at=?1, updated_at=?1
+            WHERE workshop_id=?2 AND connection_type='WORKSHOP'
+          `).bind(now(), WORKSHOP_ID).run();
+        } else {
+          await env.DB.prepare(`
+            UPDATE google_connections
+            SET status='disconnected', access_token_encrypted=NULL, refresh_token_encrypted=NULL,
+                revoked_at=?1, updated_at=?1
+            WHERE user_id=?2 AND connection_type='PERSONAL'
+          `).bind(now(), authenticatedSession.id).run();
+        }
+
+        await audit(env.DB, "google_drive.disconnected", "integration", authenticatedSession.id, { connectionType });
         return json({ ok: true });
       }
 
-      if (url.pathname === "/api/gemini/chat" && request.method === "POST") {
-        if (!env.GEMINI_API_KEY) {
-          return json({ error: "Gemini no está configurado. La integración está pendiente." }, 503);
-        }
-        const body = await readJson(request);
-        const prompt = text(body.prompt, "Consulta").slice(0, 4000);
-        const chatUserId = authenticatedSession?.id ?? "public-visitor";
-        const dailyLimit = Math.max(1, Number(env.GEMINI_DAILY_LIMIT ?? "20"));
-        const today = new Date();
-        today.setUTCHours(0, 0, 0, 0);
-        const usage = await env.DB.prepare(`
-          SELECT COUNT(*) AS count FROM gemini_usage
-          WHERE user_id=?1 AND created_at>=?2
-        `).bind(chatUserId, today.toISOString()).first<number>("count");
-        if ((usage ?? 0) >= dailyLimit) {
-          return json({ error: "Se alcanzó el límite diario de consultas" }, 429);
+      if (url.pathname === "/api/integrations/google/picker-token" && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        const connType = (url.searchParams.get("connectionType") === "PERSONAL" ? "PERSONAL" : "WORKSHOP") as GoogleConnectionType;
+
+        let conn = null;
+        if (connType === "WORKSHOP") {
+          conn = await env.DB.prepare(`
+            SELECT id, account_email, access_token_encrypted, refresh_token_encrypted, expires_at
+            FROM google_connections
+            WHERE workshop_id=?1 AND connection_type='WORKSHOP' AND status='connected'
+            LIMIT 1
+          `).bind(WORKSHOP_ID).first<{
+            id: string;
+            account_email: string | null;
+            access_token_encrypted: string | null;
+            refresh_token_encrypted: string | null;
+            expires_at: string | null;
+          }>();
+        } else {
+          conn = await env.DB.prepare(`
+            SELECT id, account_email, access_token_encrypted, refresh_token_encrypted, expires_at
+            FROM google_connections
+            WHERE user_id=?1 AND connection_type='PERSONAL' AND status='connected'
+            LIMIT 1
+          `).bind(authenticatedSession.id).first<{
+            id: string;
+            account_email: string | null;
+            access_token_encrypted: string | null;
+            refresh_token_encrypted: string | null;
+            expires_at: string | null;
+          }>();
         }
 
-        const model = env.GEMINI_MODEL ?? "gemini-2.5-flash";
-        const started = Date.now();
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 30000);
-        let geminiResponse: Response;
-        try {
-          geminiResponse = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-            {
-              method: "POST",
-              headers: {
-                "content-type": "application/json",
-                "x-goog-api-key": env.GEMINI_API_KEY
-              },
-              body: JSON.stringify({
-                systemInstruction: {
-                  parts: [{
-                    text: "Eres Group Repair Intelligence. Actúa como asistente técnico, no como autoridad definitiva. Diferencia hechos, hipótesis y recomendaciones. No inventes diagnósticos ni confirmes reparaciones no verificadas. No sugieras ejecutar cambios automáticos."
-                  }]
-                },
-                contents: [{ role: "user", parts: [{ text: prompt }] }],
-                generationConfig: { temperature: 0.2, maxOutputTokens: 800 }
-              }),
-              signal: controller.signal
-            }
-          );
-        } finally {
-          clearTimeout(timeout);
+        if (!conn || !conn.access_token_encrypted) {
+          return json({ error: `No hay cuenta de Google Drive (${connType}) conectada` }, 404);
         }
-        const responseBody = await geminiResponse.json() as {
-          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-          error?: { message?: string; code?: number };
+
+        if (!env.OAUTH_TOKEN_ENCRYPTION_KEY) {
+          return json({ error: "Falta configuración de cifrado" }, 503);
+        }
+
+        let accessToken: string;
+        if (conn.expires_at && isTokenExpired(conn.expires_at)) {
+          if (!conn.refresh_token_encrypted || !env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
+            return json({ error: "Token de acceso expirado y no se puede renovar automáticamente" }, 401);
+          }
+          const refreshToken = await decryptSecret(conn.refresh_token_encrypted, env.OAUTH_TOKEN_ENCRYPTION_KEY);
+          const refreshRes = await fetch("https://oauth2.googleapis.com/token", {
+            method: "POST",
+            headers: { "content-type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+              client_id: env.GOOGLE_CLIENT_ID,
+              client_secret: env.GOOGLE_CLIENT_SECRET,
+              refresh_token: refreshToken,
+              grant_type: "refresh_token"
+            })
+          });
+          const refreshBody = await refreshRes.json() as { access_token?: string; expires_in?: number; error?: string };
+          if (!refreshRes.ok || !refreshBody.access_token) {
+            return json({ error: refreshBody.error ?? "No se pudo renovar el token de Google" }, 502);
+          }
+          accessToken = refreshBody.access_token;
+          const accessEncrypted = await encryptSecret(accessToken, env.OAUTH_TOKEN_ENCRYPTION_KEY);
+          const newExpiresAt = new Date(Date.now() + (refreshBody.expires_in ?? 3600) * 1000).toISOString();
+          await env.DB.prepare(`
+            UPDATE google_connections
+            SET access_token_encrypted=?1, expires_at=?2, updated_at=?3
+            WHERE id=?4
+          `).bind(accessEncrypted, newExpiresAt, now(), conn.id).run();
+        } else {
+          accessToken = await decryptSecret(conn.access_token_encrypted, env.OAUTH_TOKEN_ENCRYPTION_KEY);
+        }
+
+        return json({
+          accessToken,
+          email: conn.account_email,
+          connectionType: connType,
+          appId: env.GOOGLE_CLIENT_ID ? env.GOOGLE_CLIENT_ID.split("-")[0] : null
+        });
+      }
+
+      // --- Order Attachments & Photos Endpoints ---
+      const orderAttachmentsMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/attachments$/);
+      if (orderAttachmentsMatch && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        const orderId = orderAttachmentsMatch[1];
+        const order = await env.DB.prepare(
+          "SELECT id, workshop_id, assigned_user_id, created_by FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; assigned_user_id: string | null; created_by: string | null }>();
+        if (!order) return json({ error: "Orden no encontrada" }, 404);
+        if (!canAccessOrder(authenticatedSession, order)) {
+          return json({ error: "No tenés permiso para acceder a los archivos de esta orden" }, 403);
+        }
+        const attachments = await env.DB.prepare(`
+          SELECT a.id, a.order_id, a.storage_provider, a.external_file_id, a.file_name,
+                 a.mime_type, a.file_size, a.category, a.uploaded_by, a.web_view_link,
+                 a.created_at, u.name AS uploader_name, gc.connection_type AS drive_origin
+          FROM order_attachments a
+          LEFT JOIN users u ON u.id = a.uploaded_by
+          LEFT JOIN google_connections gc ON gc.id = a.source_connection_id
+          WHERE a.workshop_id=?1 AND a.order_id=?2 AND a.deleted_at IS NULL
+          ORDER BY a.created_at DESC
+        `).bind(WORKSHOP_ID, orderId).all();
+        return json({ attachments: attachments.results });
+      }
+
+      const orderPhotoUploadMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/attachments\/photo$/);
+      if (orderPhotoUploadMatch && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        const orderId = orderPhotoUploadMatch[1];
+        const order = await env.DB.prepare(
+          "SELECT id, workshop_id, device_id, assigned_user_id, created_by FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; device_id: string | null; assigned_user_id: string | null; created_by: string | null }>();
+        if (!order) return json({ error: "Orden no encontrada" }, 404);
+        if (!canAccessOrder(authenticatedSession, order)) {
+          return json({ error: "No tenés permiso para subir fotografías a esta orden" }, 403);
+        }
+        if (!env.FILES) {
+          return json({ error: "El almacenamiento R2 no está configurado en este entorno" }, 503);
+        }
+
+        const formData = await request.formData();
+        const file = formData.get("photo");
+        if (!file || typeof file === "string") {
+          return json({ error: "Se requiere un archivo de imagen ('photo')" }, 400);
+        }
+        const categoryInput = formData.get("category")?.toString() ?? "RECEPCION";
+        const category = isValidCategory(categoryInput) ? categoryInput : "RECEPCION";
+
+        if (file.size > MAX_PHOTO_SIZE_BYTES) {
+          return json({ error: "El archivo supera el tamaño máximo permitido de 15MB" }, 400);
+        }
+
+        const arrayBuffer = await file.arrayBuffer();
+        const bytes = new Uint8Array(arrayBuffer);
+        const sigValidation = validateImageSignature(bytes);
+        if (!sigValidation.valid || !sigValidation.detectedMime) {
+          return json({ error: "Formato de archivo no válido. Solo se admiten JPEG, PNG o WebP." }, 400);
+        }
+
+        const attachmentId = uuid();
+        const sanitizedName = sanitizeFileName(file.name || `photo_${Date.now()}.${sigValidation.detectedMime.split("/")[1]}`);
+        const storageKey = generateR2StorageKey(WORKSHOP_ID, orderId, attachmentId, sanitizedName);
+
+        await env.FILES.put(storageKey, arrayBuffer, {
+          httpMetadata: {
+            contentType: sigValidation.detectedMime
+          },
+          customMetadata: {
+            workshopId: WORKSHOP_ID,
+            orderId,
+            uploadedBy: authenticatedSession.id,
+            category
+          }
+        });
+
+        await env.DB.prepare(`
+          INSERT INTO order_attachments (
+            id, workshop_id, order_id, device_id, storage_provider,
+            object_key, file_name, mime_type, file_size, category,
+            uploaded_by, visibility, created_at
+          )
+          VALUES (?1, ?2, ?3, ?4, 'R2', ?5, ?6, ?7, ?8, ?9, ?10, 'INTERNAL', ?11)
+        `).bind(
+          attachmentId,
+          WORKSHOP_ID,
+          orderId,
+          order.device_id,
+          storageKey,
+          sanitizedName,
+          sigValidation.detectedMime,
+          file.size,
+          category,
+          authenticatedSession.id,
+          now()
+        ).run();
+
+        await audit(env.DB, "order.attachment_uploaded", "order_attachment", attachmentId, {
+          orderId,
+          category,
+          fileName: sanitizedName,
+          fileSize: file.size
+        });
+
+        return json({
+          id: attachmentId,
+          orderId,
+          storageProvider: "R2",
+          fileName: sanitizedName,
+          mimeType: sigValidation.detectedMime,
+          fileSize: file.size,
+          category,
+          createdAt: now()
+        }, 201);
+      }
+
+      const attachmentContentMatch = url.pathname.match(/^\/api\/attachments\/([^/]+)\/content$/);
+      if (attachmentContentMatch && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        const attachmentId = attachmentContentMatch[1];
+        const attachment = await env.DB.prepare(`
+          SELECT a.id, a.workshop_id, a.order_id, a.storage_provider, a.object_key,
+                 a.file_name, a.mime_type, ro.assigned_user_id, ro.created_by
+          FROM order_attachments a
+          JOIN repair_orders ro ON ro.id = a.order_id
+          WHERE a.id=?1 AND a.workshop_id=?2 AND a.deleted_at IS NULL
+        `).bind(attachmentId, WORKSHOP_ID).first<{
+          id: string;
+          workshop_id: string;
+          order_id: string;
+          storage_provider: string;
+          object_key: string | null;
+          file_name: string;
+          mime_type: string;
+          assigned_user_id: string | null;
+          created_by: string | null;
+        }>();
+
+        if (!attachment) return json({ error: "Archivo no encontrado" }, 404);
+        if (!canAccessOrder(authenticatedSession, attachment)) {
+          return json({ error: "No tenés permiso para ver este archivo" }, 403);
+        }
+        if (attachment.storage_provider !== "R2" || !attachment.object_key) {
+          return json({ error: "Este archivo no se almacena en R2" }, 400);
+        }
+        if (!env.FILES) {
+          return json({ error: "Almacenamiento R2 no disponible" }, 503);
+        }
+
+        const object = await env.FILES.get(attachment.object_key);
+        if (!object) return json({ error: "El archivo no existe en el almacenamiento" }, 404);
+
+        const headers = new Headers();
+        headers.set("Content-Type", attachment.mime_type || "application/octet-stream");
+        headers.set("Content-Disposition", `inline; filename="${attachment.file_name}"`);
+        headers.set("X-Content-Type-Options", "nosniff");
+        headers.set("Cache-Control", "private, max-age=3600");
+        headers.set("Content-Security-Policy", "default-src 'none'; sandbox");
+
+        return new Response(object.body as ReadableStream, {
+          status: 200,
+          headers
+        });
+      }
+
+      const orderDriveLinkMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/attachments\/drive$/);
+      if (orderDriveLinkMatch && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        const orderId = orderDriveLinkMatch[1];
+        const order = await env.DB.prepare(
+          "SELECT id, workshop_id, device_id, assigned_user_id, created_by FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; device_id: string | null; assigned_user_id: string | null; created_by: string | null }>();
+        if (!order) return json({ error: "Orden no encontrada" }, 404);
+        if (!canAccessOrder(authenticatedSession, order)) {
+          return json({ error: "No tenés permiso para adjuntar documentos a esta orden" }, 403);
+        }
+
+        const body = await readJson(request) as {
+          driveFileId?: string;
+          fileName?: string;
+          mimeType?: string;
+          webViewLink?: string;
+          fileSize?: number;
+          origin?: string;
+          category?: string;
         };
-        if (!geminiResponse.ok) {
-          await env.DB.prepare(
-            "INSERT INTO gemini_usage (id,user_id,model,input_chars,output_chars,latency_ms,success,error_code,created_at) VALUES (?1,?2,?3,?4,0,?5,0,?6,?7)"
-          ).bind(uuid(), chatUserId, model, prompt.length, Date.now() - started, String(responseBody.error?.code ?? "gemini_error"), now()).run();
-          return json({ error: "Gemini no pudo procesar la consulta" }, 502);
+
+        const driveFileId = text(body.driveFileId, "ID de archivo en Drive");
+        const fileName = text(body.fileName, "Nombre de archivo");
+        const mimeType = body.mimeType || "application/octet-stream";
+        const webViewLink = body.webViewLink || null;
+        const origin = (body.origin === "WORKSHOP" ? "WORKSHOP" : "PERSONAL") as GoogleConnectionType;
+        const category = isValidCategory(body.category ?? "") ? body.category! : "OTROS";
+
+        let sourceConn = null;
+        if (origin === "WORKSHOP") {
+          sourceConn = await env.DB.prepare(
+            "SELECT id FROM google_connections WHERE workshop_id=?1 AND connection_type='WORKSHOP' AND status='connected' LIMIT 1"
+          ).bind(WORKSHOP_ID).first<{ id: string }>();
+        } else {
+          sourceConn = await env.DB.prepare(
+            "SELECT id FROM google_connections WHERE user_id=?1 AND connection_type='PERSONAL' AND status='connected' LIMIT 1"
+          ).bind(authenticatedSession.id).first<{ id: string }>();
         }
-        const answer = responseBody.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("\n").trim();
-        if (!answer) return json({ error: "Gemini devolvió una respuesta vacía" }, 502);
-        await env.DB.batch([
-          env.DB.prepare(
-            "INSERT INTO gemini_usage (id,user_id,model,input_chars,output_chars,latency_ms,success,error_code,created_at) VALUES (?1,?2,?3,?4,?5,?6,1,NULL,?7)"
-          ).bind(uuid(), chatUserId, model, prompt.length, answer.length, Date.now() - started, now()),
-          env.DB.prepare(
-            "INSERT INTO gemini_history (id,user_id,role,content_preview,created_at) VALUES (?1,?2,'user',?3,?4)"
-          ).bind(uuid(), chatUserId, prompt.slice(0, 240), now()),
-          env.DB.prepare(
-            "INSERT INTO gemini_history (id,user_id,role,content_preview,created_at) VALUES (?1,?2,'assistant',?3,?4)"
-          ).bind(uuid(), chatUserId, answer.slice(0, 240), now())
-        ]);
-        return json({ answer, model, disclaimer: "Asistente técnico: confirmar diagnósticos y operaciones con criterio humano." });
+
+        const attachmentId = uuid();
+        await env.DB.prepare(`
+          INSERT INTO order_attachments (
+            id, workshop_id, order_id, device_id, storage_provider,
+            source_connection_id, external_file_id, file_name, mime_type,
+            file_size, category, uploaded_by, visibility, web_view_link, created_at
+          )
+          VALUES (?1, ?2, ?3, ?4, 'GOOGLE_DRIVE', ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'INTERNAL', ?12, ?13)
+        `).bind(
+          attachmentId,
+          WORKSHOP_ID,
+          orderId,
+          order.device_id,
+          sourceConn?.id ?? null,
+          driveFileId,
+          fileName,
+          mimeType,
+          body.fileSize || 0,
+          category,
+          authenticatedSession.id,
+          webViewLink,
+          now()
+        ).run();
+
+        await audit(env.DB, "order.drive_document_linked", "order_attachment", attachmentId, {
+          orderId,
+          driveFileId,
+          fileName,
+          origin
+        });
+
+        return json({
+          id: attachmentId,
+          orderId,
+          storageProvider: "GOOGLE_DRIVE",
+          fileName,
+          mimeType,
+          webViewLink,
+          category,
+          createdAt: now()
+        }, 201);
+      }
+
+      const orderAttachmentDeleteMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/attachments\/([^/]+)$/);
+      if (orderAttachmentDeleteMatch && request.method === "DELETE") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        const orderId = orderAttachmentDeleteMatch[1];
+        const attachmentId = orderAttachmentDeleteMatch[2];
+
+        const attachment = await env.DB.prepare(`
+          SELECT a.id, a.workshop_id, a.order_id, a.uploaded_by, ro.assigned_user_id, ro.created_by
+          FROM order_attachments a
+          JOIN repair_orders ro ON ro.id = a.order_id
+          WHERE a.id=?1 AND a.order_id=?2 AND a.workshop_id=?3 AND a.deleted_at IS NULL
+        `).bind(attachmentId, orderId, WORKSHOP_ID).first<{
+          id: string;
+          workshop_id: string;
+          order_id: string;
+          uploaded_by: string;
+          assigned_user_id: string | null;
+          created_by: string | null;
+        }>();
+
+        if (!attachment) return json({ error: "Archivo adjunto no encontrado" }, 404);
+
+        const canDelete = authenticatedSession.role === "admin" || attachment.uploaded_by === authenticatedSession.id;
+        if (!canDelete) {
+          return json({ error: "Solo los administradores o el usuario que subió el archivo pueden eliminarlo" }, 403);
+        }
+
+        await env.DB.prepare(
+          "UPDATE order_attachments SET deleted_at=?1 WHERE id=?2 AND workshop_id=?3"
+        ).bind(now(), attachmentId, WORKSHOP_ID).run();
+
+        await audit(env.DB, "order.attachment_deleted", "order_attachment", attachmentId, { orderId });
+        return json({ ok: true });
       }
 
       if (url.pathname === "/api/dashboard" && request.method === "GET") {

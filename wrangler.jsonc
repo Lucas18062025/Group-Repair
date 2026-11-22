@@ -17,5 +17,11 @@
       "database_name": "group-repair-db",
       "database_id": "3c27f3d4-ccf0-4148-8846-5e0a2a7ea4e8"
     }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "group-repair-files"
+    }
   ]
 }
