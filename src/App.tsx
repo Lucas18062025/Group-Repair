@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import { formatDateTimeDisplay, formatDateTimeLocal } from "./domain/dates";
 
 type Tab = "panel" | "clientes" | "equipos" | "ordenes" | "inventario" | "integraciones" | "gemini" | "asistencia";
 
@@ -247,6 +248,7 @@ export default function App() {
   const [orderSearch, setOrderSearch] = useState("");
   const [orderFilter, setOrderFilter] = useState("TODAS");
   const [showOrderForm, setShowOrderForm] = useState(false);
+  const [defaultReceivedAt, setDefaultReceivedAt] = useState(() => formatDateTimeLocal());
   const [availableDevices, setAvailableDevices] = useState<Device[]>([]);
   const [chatOpen, setChatOpen] = useState(false);
   const [chatConsent, setChatConsent] = useState(false);
@@ -1038,18 +1040,19 @@ export default function App() {
     const detail = await api<{ devices: Device[]; orders: Order[] }>(`/api/customers/${customer.id}`).catch(() => null);
     const deviceCount = detail?.devices.length ?? 0;
     const orderCount = detail?.orders.length ?? 0;
-    const confirmation = window.prompt(
-      `Eliminar a "${customer.name}" también eliminará ${deviceCount} equipo(s) y ${orderCount} orden(es), con sus dependencias asociadas.\n\nEscribe el nombre exacto para confirmar.`,
-      ""
-    );
+    const hasHistory = deviceCount > 0 || orderCount > 0;
+    const confirmPrompt = hasHistory
+      ? `"${customer.name}" tiene ${deviceCount} equipo(s) y ${orderCount} orden(es) registradas.\n\nPara preservar el historial técnico, el cliente será archivado y dejará de aparecer en la lista activa.\n\nEscribe el nombre exacto para confirmar.`
+      : `¿Eliminar definitivamente al cliente "${customer.name}"?\n\nEscribe el nombre exacto para confirmar.`;
+    const confirmation = window.prompt(confirmPrompt, "");
     if (confirmation !== customer.name) return;
     try {
-      await api(`/api/customers/${customer.id}`, {
+      const res = await api<{ ok: boolean; action?: string; message?: string }>(`/api/customers/${customer.id}`, {
         method: "DELETE",
         body: JSON.stringify({ confirmName: confirmation })
       });
       setSelectedCustomer(null);
-      setMessage("Cliente y sus datos asociados eliminados");
+      setMessage(res.message ?? (res.action === "archived" ? "Cliente archivado. Se conserva su historial y registros asociados." : "Cliente eliminado definitivamente"));
       await refresh();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "No se pudo eliminar el cliente");
@@ -1117,6 +1120,7 @@ export default function App() {
         })
       });
       formElement.reset();
+      setDefaultReceivedAt(formatDateTimeLocal());
       setMessage(`Orden ${created.reference} creada`);
       await refresh();
     } catch (error) {
@@ -1167,6 +1171,7 @@ export default function App() {
         })
       });
       formElement.reset();
+      setDefaultReceivedAt(formatDateTimeLocal());
       setCustomerOrderPrefill("");
       setShowOrderForm(false);
       setMessage(`Orden ${created.reference} creada`);
@@ -1758,10 +1763,10 @@ export default function App() {
                   <label>Condición física<input name="condition" /></label>
                   <label>Falla reportada<input name="reportedFault" /></label>
                   <label>Accesorios<input name="accessories" /></label>
-                  <label>Problema de la orden<input name="reportedIssue" required /></label>
+                  <label>Presupuesto<input name="reportedIssue" required /></label>
                   <label>Observaciones<textarea name="observations" rows={3} /></label>
                   <label>Prioridad<select name="priority"><option value="normal">Normal</option><option value="alta">Alta</option><option value="urgente">Urgente</option></select></label>
-                  <label>Fecha de recepción<input name="receivedAt" type="datetime-local" /></label>
+                  <label>Fecha de recepción<input name="receivedAt" type="datetime-local" defaultValue={defaultReceivedAt} key={defaultReceivedAt} /></label>
                   <label>Entrega estimada<input name="estimated" type="datetime-local" /></label>
                   <button className="primary" type="submit" disabled={busy}>Crear equipo y orden</button>
                 </form>
@@ -1774,7 +1779,7 @@ export default function App() {
           <section className="content">
             <header className="inventory-header">
               <div><p className="eyebrow">Gestión de reparaciones</p><h2>Órdenes</h2><p>Seguimiento completo desde la recepción hasta la entrega.</p></div>
-              <button className="primary" type="button" onClick={() => setShowOrderForm(true)}>Nueva orden</button>
+              <button className="primary" type="button" onClick={() => { setDefaultReceivedAt(formatDateTimeLocal()); setShowOrderForm(true); }}>Nueva orden</button>
             </header>
             <div className="inventory-toolbar">
               <label className="inventory-search">Buscar
@@ -1798,7 +1803,7 @@ export default function App() {
                 {orders
                   .filter((order) => orderFilter === "TODAS" || order.status === orderFilter || (orderFilter === "WAITING_FOR_PARTS" && ["WAITING_FOR_PARTS", "QUOTED", "APPROVED"].includes(order.status)) || (orderFilter === "READY_FOR_DELIVERY" && ["TESTING", "READY_FOR_DELIVERY", "NOT_REPAIRABLE"].includes(order.status)))
                   .filter((order) => !orderSearch || `${order.reference} ${order.customer_name} ${order.brand} ${order.model} ${order.reported_issue}`.toLowerCase().includes(orderSearch.toLowerCase()))
-                  .map(order => <tr key={order.id}><td><strong>{order.reference}</strong></td><td>{order.customer_name}<br /><small>{order.customer_phone ?? ""}</small></td><td>{order.brand} {order.model}{order.serial_number ? ` · ${order.serial_number}` : ""}</td><td>{order.received_at ? new Date(order.received_at).toLocaleString("es-AR") : new Date(order.created_at).toLocaleString("es-AR")}</td><td><span className="badge">{statusLabel(order.status)}</span></td><td>{order.technician_name ?? "Sin asignar"}</td><td>{formatMoney(order.total_minor ?? 0)}</td><td>{new Date(order.created_at).toLocaleString("es-AR")}</td><td><div className="row-actions"><button className="secondary" type="button" onClick={() => openOrder(order)}>Detalle</button><button className="secondary" type="button" onClick={() => editOrder(order)}>Editar</button></div></td></tr>)}
+                  .map(order => <tr key={order.id}><td><strong>{order.reference}</strong></td><td>{order.customer_name}<br /><small>{order.customer_phone ?? ""}</small></td><td>{order.brand} {order.model}{order.serial_number ? ` · ${order.serial_number}` : ""}</td><td>{order.received_at ? formatDateTimeDisplay(order.received_at) : formatDateTimeDisplay(order.created_at)}</td><td><span className="badge">{statusLabel(order.status)}</span></td><td>{order.technician_name ?? "Sin asignar"}</td><td>{formatMoney(order.total_minor ?? 0)}</td><td>{formatDateTimeDisplay(order.created_at)}</td><td><div className="row-actions"><button className="secondary" type="button" onClick={() => openOrder(order)}>Detalle</button><button className="secondary" type="button" onClick={() => editOrder(order)}>Editar</button></div></td></tr>)}
               </tbody></table></div>
               {!orders.length && <p className="empty">Todavía no hay órdenes registradas. Crea la primera desde este módulo.</p>}
             </article>
@@ -1829,7 +1834,7 @@ export default function App() {
                     <label>Problema informado<input name="reportedIssue" required /></label>
                     <label>Observaciones<textarea name="observations" rows={3} /></label>
                     <label>Prioridad<select name="priority"><option value="normal">Normal</option><option value="alta">Alta</option><option value="urgente">Urgente</option></select></label>
-                    <label>Fecha de recepción<input name="receivedAt" type="datetime-local" /></label>
+                    <label>Fecha de recepción<input name="receivedAt" type="datetime-local" defaultValue={defaultReceivedAt} key={`modal-${defaultReceivedAt}`} /></label>
                     <label>Entrega estimada<input name="estimated" type="datetime-local" /></label>
                     <button className="primary" type="submit" disabled={busy}>Guardar orden</button>
                   </form>

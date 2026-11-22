@@ -1,6 +1,8 @@
 import { canTransition, ORDER_STATUSES, type OrderStatus } from "./domain/status";
 import { calculateLineTotal } from "./domain/money";
 import { createPublicReference, isValidEmail, isValidPhone, phonesMatch } from "./domain/assistant";
+import { parseDateTimeLocalToUtcIso } from "./domain/dates";
+import { determineCustomerDeletionAction } from "./domain/customer";
 import {
   clearSessionCookie,
   decryptSecret,
@@ -749,7 +751,7 @@ export default {
       if (url.pathname === "/api/dashboard" && request.method === "GET") {
         const [orders, customers, devices, lowStock, payments] = await Promise.all([
           env.DB.prepare("SELECT status, COUNT(*) AS count FROM repair_orders WHERE workshop_id=?1 GROUP BY status").bind(WORKSHOP_ID).all<{ status: string; count: number }>(),
-          env.DB.prepare("SELECT COUNT(*) AS count FROM customers WHERE workshop_id=?1").bind(WORKSHOP_ID).first<number>("count"),
+          env.DB.prepare("SELECT COUNT(*) AS count FROM customers WHERE workshop_id=?1 AND status='ACTIVO'").bind(WORKSHOP_ID).first<number>("count"),
           env.DB.prepare("SELECT COUNT(*) AS count FROM devices WHERE workshop_id=?1").bind(WORKSHOP_ID).first<number>("count"),
           env.DB.prepare(`
             SELECT p.id,p.sku,p.name,p.minimum_stock,
@@ -776,7 +778,7 @@ export default {
            FROM customers c
            LEFT JOIN devices d ON d.customer_id=c.id AND d.workshop_id=c.workshop_id
            LEFT JOIN repair_orders ro ON ro.customer_id=c.id AND ro.workshop_id=c.workshop_id
-           WHERE c.workshop_id=?1
+           WHERE c.workshop_id=?1 AND c.status='ACTIVO'
            GROUP BY c.id
            ORDER BY c.created_at DESC LIMIT 100`
         ).bind(WORKSHOP_ID).all();
@@ -862,40 +864,60 @@ export default {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para eliminar clientes" }, 401);
         const customerId = customerMatch[1];
         const existing = await env.DB.prepare(
-          "SELECT owner_user_id,name FROM customers WHERE id=?1 AND workshop_id=?2"
-        ).bind(customerId, WORKSHOP_ID).first<{ owner_user_id: string | null; name: string }>();
+          "SELECT owner_user_id,name,status FROM customers WHERE id=?1 AND workshop_id=?2"
+        ).bind(customerId, WORKSHOP_ID).first<{ owner_user_id: string | null; name: string; status: string }>();
         if (!existing) return json({ error: "Cliente no encontrado" }, 404);
         if (!ownsOrCanAdmin(authenticatedSession, existing.owner_user_id)) {
           return json({ error: "No tienes permiso para eliminar este cliente" }, 403);
         }
-        const dependencies = await env.DB.prepare(`
-          SELECT
-            (SELECT COUNT(*) FROM devices WHERE customer_id=?1 AND workshop_id=?2) AS devices,
-            (SELECT COUNT(*) FROM repair_orders WHERE customer_id=?1 AND workshop_id=?2) AS orders,
-            (SELECT COUNT(*) FROM quote_versions WHERE order_id IN (SELECT id FROM repair_orders WHERE customer_id=?1 AND workshop_id=?2)) AS quotes,
-            (SELECT COUNT(*) FROM diagnostics WHERE order_id IN (SELECT id FROM repair_orders WHERE customer_id=?1 AND workshop_id=?2)) AS diagnostics,
-            (SELECT COUNT(*) FROM payment_transactions WHERE order_id IN (SELECT id FROM repair_orders WHERE customer_id=?1 AND workshop_id=?2)) AS payments
-        `).bind(customerId, WORKSHOP_ID).first<{ devices: number; orders: number; quotes: number; diagnostics: number; payments: number }>();
         const body = await readJson(request);
         if (body.confirmName !== existing.name) {
           return json({
-            error: "Confirmación por nombre requerida",
-            dependencies
+            error: "Confirmación por nombre requerida"
           }, 409);
         }
-        await env.DB.batch([
-          env.DB.prepare("DELETE FROM quote_lines WHERE workshop_id=?1 AND quote_version_id IN (SELECT id FROM quote_versions WHERE order_id IN (SELECT id FROM repair_orders WHERE customer_id=?2))").bind(WORKSHOP_ID, customerId),
-          env.DB.prepare("DELETE FROM stock_movements WHERE workshop_id=?1 AND order_id IN (SELECT id FROM repair_orders WHERE customer_id=?2)").bind(WORKSHOP_ID, customerId),
-          env.DB.prepare("DELETE FROM payment_transactions WHERE workshop_id=?1 AND order_id IN (SELECT id FROM repair_orders WHERE customer_id=?2)").bind(WORKSHOP_ID, customerId),
-          env.DB.prepare("DELETE FROM diagnostics WHERE workshop_id=?1 AND order_id IN (SELECT id FROM repair_orders WHERE customer_id=?2)").bind(WORKSHOP_ID, customerId),
-          env.DB.prepare("DELETE FROM quote_versions WHERE workshop_id=?1 AND order_id IN (SELECT id FROM repair_orders WHERE customer_id=?2)").bind(WORKSHOP_ID, customerId),
-          env.DB.prepare("DELETE FROM order_status_events WHERE workshop_id=?1 AND order_id IN (SELECT id FROM repair_orders WHERE customer_id=?2)").bind(WORKSHOP_ID, customerId),
-          env.DB.prepare("DELETE FROM repair_orders WHERE workshop_id=?1 AND customer_id=?2").bind(WORKSHOP_ID, customerId),
-          env.DB.prepare("DELETE FROM devices WHERE workshop_id=?1 AND customer_id=?2").bind(WORKSHOP_ID, customerId),
-          env.DB.prepare("DELETE FROM customers WHERE workshop_id=?1 AND id=?2").bind(WORKSHOP_ID, customerId)
-        ]);
-        await audit(env.DB, "customer.deleted", "customer", customerId, { dependencies });
-        return json({ ok: true, deleted: { customer: 1, ...dependencies } });
+
+        const counts = await env.DB.prepare(`
+          SELECT
+            (SELECT COUNT(*) FROM devices WHERE customer_id=?1 AND workshop_id=?2) AS devices,
+            (SELECT COUNT(*) FROM repair_orders WHERE customer_id=?1 AND workshop_id=?2) AS orders,
+            (SELECT COUNT(*) FROM chat_conversations WHERE customer_id=?1 AND workshop_id=?2) AS chats,
+            (SELECT COUNT(*) FROM service_requests WHERE customer_id=?1 AND workshop_id=?2) AS requests
+        `).bind(customerId, WORKSHOP_ID).first<{ devices: number; orders: number; chats: number; requests: number }>();
+
+        const dependencies = {
+          devices: counts?.devices ?? 0,
+          orders: counts?.orders ?? 0,
+          chats: counts?.chats ?? 0,
+          requests: counts?.requests ?? 0
+        };
+
+        const action = determineCustomerDeletionAction(dependencies);
+
+        if (action === "archive") {
+          // Caso B: Cliente con registros relacionados -> Archivar de forma segura sin eliminar órdenes ni equipos
+          await env.DB.prepare(
+            "UPDATE customers SET status='ARCHIVADO',updated_at=?1 WHERE id=?2 AND workshop_id=?3"
+          ).bind(now(), customerId, WORKSHOP_ID).run();
+          await audit(env.DB, "customer.archived", "customer", customerId, { dependencies }, authenticatedSession.id);
+          return json({
+            ok: true,
+            action: "archived",
+            message: "Cliente archivado. Se conserva su historial y registros asociados.",
+            dependencies
+          });
+        }
+
+        // Caso A: Cliente sin registros relacionados -> Eliminación definitiva física en D1
+        await env.DB.prepare(
+          "DELETE FROM customers WHERE workshop_id=?1 AND id=?2"
+        ).bind(WORKSHOP_ID, customerId).run();
+        await audit(env.DB, "customer.deleted", "customer", customerId, null, authenticatedSession.id);
+        return json({
+          ok: true,
+          action: "deleted",
+          message: "Cliente eliminado definitivamente"
+        });
       }
 
       if (url.pathname === "/api/devices" && request.method === "POST") {
@@ -965,7 +987,7 @@ export default {
         const status = body.status ? text(body.status, "Estado").toUpperCase() : "RECEIVED";
         if (!(ORDER_STATUSES as readonly string[]).includes(status)) return json({ error: "Estado inicial no válido" }, 400);
         if (status !== "RECEIVED") return json({ error: "La orden debe iniciar en estado Recibida" }, 400);
-        const receivedAt = body.receivedAt ? text(body.receivedAt, "Fecha de recepción") : timestamp;
+        const receivedAt = body.receivedAt ? parseDateTimeLocalToUtcIso(text(body.receivedAt, "Fecha de recepción")) : timestamp;
         await env.DB.batch([
           env.DB.prepare(
             "INSERT INTO repair_orders (id,workshop_id,customer_id,device_id,reference,reported_issue,priority,status,estimated_completion_at,received_at,observations,accessories,assigned_user_id,owner_user_id,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"
@@ -1033,7 +1055,7 @@ export default {
             text(body.reportedIssue, "Problema"),
             body.priority ? text(body.priority, "Prioridad") : "normal",
             body.estimatedCompletionAt ? text(body.estimatedCompletionAt, "Fecha estimada") : null,
-            body.receivedAt ? text(body.receivedAt, "Fecha de recepción") : now(),
+            body.receivedAt ? parseDateTimeLocalToUtcIso(text(body.receivedAt, "Fecha de recepción")) : now(),
             body.observations ? text(body.observations, "Observaciones") : null,
             body.accessories ? text(body.accessories, "Accesorios") : null,
             body.assignedUserId ? text(body.assignedUserId, "Técnico") : null,
