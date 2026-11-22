@@ -231,6 +231,22 @@ export default {
           await env.DB.prepare(
             "INSERT OR IGNORE INTO google_identities (id,user_id,google_sub,email,email_verified,created_at) VALUES (?1,?2,?3,?4,?5,?6)"
           ).bind(uuid(), user.id, payload.sub, payload.email, payload.email_verified ? 1 : 0, now()).run();
+
+          const allowlistEntry = await env.DB.prepare(
+            "SELECT id FROM google_access_allowlist WHERE workshop_id=?1 AND status='ACTIVE' AND (google_sub=?2 OR email=?3)"
+          ).bind(WORKSHOP_ID, payload.sub, payload.email).first("id");
+          if (allowlistEntry && user.status === "PENDING") {
+            await env.DB.prepare(
+              "UPDATE users SET status='APPROVED',deactivated_at=NULL WHERE id=?1"
+            ).bind(user.id).run();
+            user.status = "APPROVED";
+            user.deactivated_at = null;
+          }
+          if (allowlistEntry) {
+            await env.DB.prepare(
+              "UPDATE google_access_allowlist SET google_sub=?1,updated_at=?2 WHERE id=?3"
+            ).bind(payload.sub, now(), allowlistEntry).run();
+          }
         }
 
         const activeAdmins = await env.DB.prepare(
@@ -343,6 +359,22 @@ export default {
         return json({ ok: true });
       }
 
+      const roleMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/role$/);
+      if (roleMatch && request.method === "POST") {
+        if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
+        const userId = roleMatch[1];
+        if (userId === authenticatedSession.id) return json({ error: "No puedes cambiar tu propio rol" }, 409);
+        const body = await readJson(request);
+        const role = text(body.role, "Rol");
+        const allowedRoles = ["admin", "reception", "technician", "technical_lead", "cashier", "viewer"];
+        if (!allowedRoles.includes(role)) return json({ error: "Rol no válido" }, 400);
+        await env.DB.prepare(
+          "UPDATE users SET role=?1 WHERE id=?2 AND workshop_id=?3"
+        ).bind(role, userId, WORKSHOP_ID).run();
+        await audit(env.DB, "user.role_changed", "user", userId, { role });
+        return json({ ok: true });
+      }
+
       if (url.pathname === "/api/admin/google-accounts" && request.method === "GET") {
         if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
         const accounts = await env.DB.prepare(
@@ -372,6 +404,25 @@ export default {
       if (allowlistDelete && request.method === "DELETE") {
         if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
         const accountId = allowlistDelete[1];
+        const account = await env.DB.prepare(
+          "SELECT email,google_sub FROM google_access_allowlist WHERE id=?1 AND workshop_id=?2"
+        ).bind(accountId, WORKSHOP_ID).first<{ email: string; google_sub: string | null }>();
+        if (account) {
+          const accountUser = await env.DB.prepare(`
+            SELECT u.id FROM users u
+            LEFT JOIN google_identities g ON g.user_id=u.id
+            WHERE u.workshop_id=?1 AND (u.email=?2 OR g.google_sub=?3)
+            LIMIT 1
+          `).bind(WORKSHOP_ID, account.email, account.google_sub).first<{ id: string }>();
+          if (accountUser) {
+            await env.DB.prepare(
+              "UPDATE users SET status='DEACTIVATED',deactivated_at=?1 WHERE id=?2"
+            ).bind(now(), accountUser.id).run();
+            await env.DB.prepare(
+              "UPDATE auth_sessions SET revoked_at=?1 WHERE user_id=?2 AND revoked_at IS NULL"
+            ).bind(now(), accountUser.id).run();
+          }
+        }
         await env.DB.prepare(
           "DELETE FROM google_access_allowlist WHERE id=?1 AND workshop_id=?2"
         ).bind(accountId, WORKSHOP_ID).run();
