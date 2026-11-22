@@ -296,6 +296,19 @@ export default function App() {
     }
   }
 
+  async function updateUserRole(userId: string, role: string) {
+    try {
+      await api(`/api/admin/users/${userId}/role`, {
+        method: "POST",
+        body: JSON.stringify({ role })
+      });
+      setAdminUsers((users) => users.map((user) => user.id === userId ? { ...user, role } : user));
+      setMessage("Permisos actualizados");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo actualizar el rol");
+    }
+  }
+
   async function logout() {
     await api("/api/auth/logout", { method: "POST" });
     setAuthUser(null);
@@ -452,7 +465,6 @@ export default function App() {
           ) : (
             <div className="notice">Google Sign-In pendiente de configuración externa.</div>
           )}
-          <small>El primer administrador se provisiona mediante `GOOGLE_BOOTSTRAP_SUB`.</small>
         </main>
       </div>
     ) : authUser.status !== "APPROVED" ? (
@@ -465,7 +477,6 @@ export default function App() {
             <div className="google-sub-box">
               <small>Identificador Google (`sub`)</small>
               <code>{googleSub}</code>
-              <small>Este valor permite provisionar el primer administrador de forma segura.</small>
             </div>
           )}
           <button className="primary" type="button" onClick={logout}>Cerrar sesión</button>
@@ -675,7 +686,26 @@ export default function App() {
                     <tbody>
                       {adminUsers.map((user) => (
                         <tr key={user.id}>
-                          <td>{user.name}</td><td>{user.email}</td><td>{user.role}</td><td>{user.status}</td>
+                          <td>{user.name}</td><td>{user.email}</td>
+                          <td>
+                            {user.id === authUser.id ? (
+                              <span>{user.role}</span>
+                            ) : (
+                              <select
+                                aria-label={`Rol de ${user.name}`}
+                                value={user.role}
+                                onChange={(event) => updateUserRole(user.id, event.target.value)}
+                              >
+                                <option value="admin">Administrador</option>
+                                <option value="reception">Recepción</option>
+                                <option value="technician">Técnico</option>
+                                <option value="technical_lead">Responsable técnico</option>
+                                <option value="cashier">Caja</option>
+                                <option value="viewer">Consulta</option>
+                              </select>
+                            )}
+                          </td>
+                          <td>{user.status}</td>
                           <td>
                             {user.status === "PENDING" && <button className="secondary" type="button" onClick={() => updateUserStatus(user.id, "approve")}>Aprobar</button>}
                             {user.status === "APPROVED" && user.id !== authUser.id && <button className="secondary" type="button" onClick={() => updateUserStatus(user.id, "deactivate")}>Desactivar</button>}
