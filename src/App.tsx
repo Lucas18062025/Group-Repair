@@ -90,11 +90,31 @@ interface Part {
   id: string;
   sku: string;
   name: string;
+  category: string | null;
   location: string | null;
   cost_minor: number;
   sale_price_minor: number;
   minimum_stock: number;
   stock: number;
+  status: "ACTIVO" | "INACTIVO" | "ARCHIVADO";
+  archived_at: string | null;
+  created_at: string;
+  updated_at: string | null;
+}
+
+interface StockMovement {
+  id: string;
+  part_id: string;
+  order_id: string | null;
+  kind: string;
+  quantity: number;
+  reason: string;
+  created_at: string;
+  stock_before: number | null;
+  stock_after: number | null;
+  reference: string | null;
+  sku?: string;
+  part_name?: string;
 }
 
 interface Dashboard {
@@ -161,6 +181,19 @@ export default function App() {
   const [googleAccounts, setGoogleAccounts] = useState<GoogleAllowlistAccount[]>([]);
   const [showLoginOverlay, setShowLoginOverlay] = useState(false);
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
+  const [inventorySearch, setInventorySearch] = useState("");
+  const [inventoryCategory, setInventoryCategory] = useState("TODAS");
+  const [inventoryLocation, setInventoryLocation] = useState("TODAS");
+  const [inventoryAvailability, setInventoryAvailability] = useState("TODAS");
+  const [inventorySort, setInventorySort] = useState("name");
+  const [showArchived, setShowArchived] = useState(false);
+  const [showProductForm, setShowProductForm] = useState(false);
+  const [showMovementForm, setShowMovementForm] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [selectedPart, setSelectedPart] = useState<Part | null>(null);
+  const [movements, setMovements] = useState<StockMovement[]>([]);
+  const [busyPartId, setBusyPartId] = useState<string | null>(null);
+  const [historyKind, setHistoryKind] = useState("TODOS");
 
   function navigateTab(nextTab: Tab) {
     setTab(nextTab);
@@ -469,6 +502,7 @@ export default function App() {
         body: JSON.stringify({
           sku: form.get("sku"),
           name: form.get("name"),
+          category: form.get("category"),
           location: form.get("location"),
           costMinor: Number(form.get("cost")) * 100,
           salePriceMinor: Number(form.get("price")) * 100,
@@ -547,29 +581,218 @@ export default function App() {
     }
   }
 
-  async function adjustPart(partId: string, kind: "IN" | "OUT" | "ADJUSTMENT_IN" | "ADJUSTMENT_OUT") {
-    const quantityText = window.prompt("Cantidad a registrar");
-    if (!quantityText) return;
-    const quantity = Number(quantityText);
-    if (!Number.isSafeInteger(quantity) || quantity <= 0) {
-      setMessage("La cantidad debe ser un entero positivo");
-      return;
+  async function adjustPart(partId: string, kind: "IN" | "OUT" | "ADJUSTMENT_IN" | "ADJUSTMENT_OUT", quantityOverride?: number) {
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para modificar inventario");
+      return null;
     }
+    if (busyPartId) return null;
+    setBusyPartId(partId);
     try {
-      await api(`/api/parts/${partId}/movements`, {
+      const quantityText = quantityOverride !== undefined
+        ? String(quantityOverride)
+        : kind === "OUT" || kind === "IN"
+          ? "1"
+          : window.prompt("Cantidad a registrar");
+      if (!quantityText) return null;
+      const quantity = Number(quantityText);
+      if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+        setMessage("La cantidad debe ser un entero positivo");
+        return null;
+      }
+      const reference = crypto.randomUUID();
+      const result = await api<{ stockAfter: number }>(`/api/parts/${partId}/movements`, {
         method: "POST",
         body: JSON.stringify({
           quantity,
           kind,
-          reason: kind === "OUT" ? "Salida manual de inventario" : "Ajuste manual de stock"
+          reason: kind === "OUT" ? "Salida rápida de una unidad" : kind === "IN" ? "Entrada rápida de una unidad" : "Ajuste manual de stock",
+          reference
         })
       });
       setMessage("Movimiento de stock registrado");
       await refresh();
+      return result.stockAfter;
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "No se pudo ajustar el stock");
+      return null;
+    } finally {
+      setBusyPartId(null);
     }
   }
+
+  async function quickStock(part: Part, kind: "IN" | "OUT") {
+    if (kind === "OUT" && part.stock <= 0) {
+      setMessage("El producto no tiene stock disponible");
+      return;
+    }
+    const stockAfter = await adjustPart(part.id, kind);
+    if (stockAfter !== null) {
+      setSelectedPart((current) => current?.id === part.id ? { ...current, stock: stockAfter } : current);
+    }
+  }
+
+  async function adjustToFinal(part: Part) {
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para ajustar inventario");
+      return;
+    }
+    const targetText = window.prompt(`Stock actual: ${part.stock}. Cantidad final deseada`, String(part.stock));
+    if (!targetText) return;
+    const targetStock = Number(targetText);
+    if (!Number.isSafeInteger(targetStock) || targetStock < 0) {
+      setMessage("La cantidad final debe ser un entero mayor o igual a cero");
+      return;
+    }
+    const reason = window.prompt("Motivo del ajuste", "Corrección de inventario físico");
+    if (!reason?.trim()) return;
+    if (busyPartId) return;
+    setBusyPartId(part.id);
+    try {
+      const result = await api<{ stockAfter: number }>(`/api/parts/${part.id}/movements`, {
+        method: "POST",
+        body: JSON.stringify({
+          targetStock,
+          reason: reason.trim(),
+          reference: crypto.randomUUID()
+        })
+      });
+      setMessage(`Stock ajustado a ${result.stockAfter}`);
+      await refresh();
+      setSelectedPart((current) => current?.id === part.id ? { ...current, stock: result.stockAfter } : current);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo ajustar el stock");
+    } finally {
+      setBusyPartId(null);
+    }
+  }
+
+  async function changePartStatus(part: Part, status: "ACTIVO" | "INACTIVO" | "ARCHIVADO") {
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para administrar productos");
+      return;
+    }
+    try {
+      await api(`/api/parts/${part.id}/status`, {
+        method: "PATCH",
+        body: JSON.stringify({ status })
+      });
+      setSelectedPart(null);
+      setMessage(status === "ARCHIVADO" ? "Producto archivado" : status === "ACTIVO" ? "Producto reactivado" : "Producto marcado como inactivo");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo cambiar el estado");
+    }
+  }
+
+  async function openPartDetail(part: Part) {
+    try {
+      const result = await api<{ part: Part; movements: StockMovement[] }>(`/api/parts/${part.id}`);
+      setSelectedPart(result.part);
+      setMovements(result.movements);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo abrir el detalle");
+    }
+  }
+
+  async function editPart(part: Part) {
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para editar productos");
+      return;
+    }
+    const name = window.prompt("Nombre", part.name);
+    if (!name?.trim()) return;
+    const sku = window.prompt("SKU", part.sku);
+    if (!sku?.trim()) return;
+    const category = window.prompt("Categoría", part.category ?? "");
+    const location = window.prompt("Ubicación", part.location ?? "");
+    const costText = window.prompt("Costo en pesos", String(part.cost_minor / 100));
+    const priceText = window.prompt("Precio de venta en pesos", String(part.sale_price_minor / 100));
+    const minimumText = window.prompt("Stock mínimo", String(part.minimum_stock));
+    if (costText === null || priceText === null || minimumText === null) return;
+    const costMinor = Math.round(Number(costText) * 100);
+    const salePriceMinor = Math.round(Number(priceText) * 100);
+    const minimumStock = Number(minimumText);
+    if (![costMinor, salePriceMinor, minimumStock].every(Number.isSafeInteger) || costMinor < 0 || salePriceMinor < 0 || minimumStock < 0) {
+      setMessage("Los valores monetarios y el stock mínimo deben ser válidos");
+      return;
+    }
+    try {
+      await api(`/api/parts/${part.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          sku: sku.trim(),
+          name: name.trim(),
+          category: category?.trim() || null,
+          location: location?.trim() || null,
+          costMinor,
+          salePriceMinor,
+          minimumStock
+        })
+      });
+      setMessage("Producto actualizado");
+      await refresh();
+      setSelectedPart(null);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo editar el producto");
+    }
+  }
+
+  async function loadInventoryHistory() {
+    try {
+      const kindQuery = historyKind === "TODOS" ? "" : `?kind=${encodeURIComponent(historyKind)}`;
+      const result = await api<{ movements: StockMovement[] }>(`/api/inventory/movements${kindQuery}`);
+      setMovements(result.movements);
+      setShowHistory(true);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo cargar el historial");
+    }
+  }
+
+  async function reverseMovement(movement: StockMovement) {
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para revertir movimientos");
+      return;
+    }
+    if (!window.confirm("¿Generar una reversión compensatoria sin modificar el movimiento original?")) return;
+    try {
+      await api(`/api/inventory/movements/${movement.id}/reverse`, { method: "POST" });
+      setMessage("Movimiento revertido mediante una operación compensatoria");
+      await refresh();
+      await loadInventoryHistory();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo revertir el movimiento");
+    }
+  }
+
+  const inventoryActiveParts = parts.filter((part) => part.status !== "ARCHIVADO");
+  const inventoryArchivedParts = parts.filter((part) => part.status === "ARCHIVADO");
+  const inventoryUnits = inventoryActiveParts.reduce((sum, part) => sum + part.stock, 0);
+  const inventoryLowStock = inventoryActiveParts.filter((part) => part.stock > 0 && part.stock <= part.minimum_stock).length;
+  const inventoryOutOfStock = inventoryActiveParts.filter((part) => part.stock === 0).length;
+  const inventoryValue = inventoryActiveParts.reduce((sum, part) => sum + part.stock * part.cost_minor, 0);
+  const inventoryCategories = Array.from(new Set(inventoryActiveParts.map((part) => part.category).filter((value): value is string => Boolean(value))));
+  const inventoryLocations = Array.from(new Set(inventoryActiveParts.map((part) => part.location).filter((value): value is string => Boolean(value))));
+  const inventoryVisibleParts = (showArchived ? inventoryArchivedParts : inventoryActiveParts)
+    .filter((part) => !inventorySearch || `${part.name} ${part.sku}`.toLowerCase().includes(inventorySearch.toLowerCase()))
+    .filter((part) => inventoryCategory === "TODAS" || part.category === inventoryCategory)
+    .filter((part) => inventoryLocation === "TODAS" || part.location === inventoryLocation)
+    .filter((part) => {
+      if (inventoryAvailability === "BAJO") return part.stock > 0 && part.stock <= part.minimum_stock;
+      if (inventoryAvailability === "SIN") return part.stock === 0;
+      if (inventoryAvailability === "DISPONIBLE") return part.stock > part.minimum_stock;
+      return true;
+    })
+    .sort((a, b) => {
+      if (inventorySort === "stock") return b.stock - a.stock;
+      if (inventorySort === "price") return b.sale_price_minor - a.sale_price_minor;
+      return a.name.localeCompare(b.name);
+    });
 
   return (
     <>
@@ -785,26 +1008,211 @@ export default function App() {
         )}
 
         {tab === "inventario" && (
-          <section className="content grid-two">
-            <article className="panel-card">
-              <h2>Nuevo repuesto</h2>
-              <form className="form" onSubmit={submitPart}>
-                <label>SKU<input name="sku" required /></label>
-                <label>Nombre<input name="name" required /></label>
-                <label>Ubicación<input name="location" /></label>
-                <label>Costo ($)<input name="cost" type="number" min="0" step="0.01" required /></label>
-                <label>Precio ($)<input name="price" type="number" min="0" step="0.01" required /></label>
-                <label>Stock inicial<input name="initialStock" type="number" min="0" step="1" defaultValue="0" required /></label>
-                <label>Stock mínimo<input name="minimum" type="number" min="0" defaultValue="0" required /></label>
-                <button className="primary" type="submit" disabled={busy}>Guardar repuesto</button>
-              </form>
+          <section className="content inventory-page">
+            <header className="inventory-header">
+              <div>
+                <p className="eyebrow">Existencias y repuestos</p>
+                <h2>Inventario</h2>
+                <p>Administra unidades, movimientos y productos sin abandonar el flujo operativo.</p>
+              </div>
+              <div className="inventory-actions">
+                <button className="secondary" type="button" onClick={loadInventoryHistory}>Historial</button>
+                <button className="secondary" type="button" onClick={() => setShowMovementForm(true)}>Registrar movimiento</button>
+                <button className="primary" type="button" onClick={() => setShowProductForm(true)}>Nuevo producto</button>
+              </div>
+            </header>
+
+            <div className="inventory-metrics">
+              <article><span>Productos activos</span><strong>{inventoryActiveParts.length}</strong></article>
+              <article><span>Unidades disponibles</span><strong>{inventoryUnits}</strong></article>
+              <article><span>Stock bajo</span><strong>{inventoryLowStock}</strong></article>
+              <article><span>Sin stock</span><strong>{inventoryOutOfStock}</strong></article>
+              <article><span>Valor a costo</span><strong>{formatMoney(inventoryValue)}</strong></article>
+            </div>
+
+            <div className="inventory-toolbar">
+              <label className="inventory-search">Buscar
+                <input value={inventorySearch} onChange={(event) => setInventorySearch(event.target.value)} placeholder="Nombre o SKU" />
+              </label>
+              <label>Categoría
+                <select value={inventoryCategory} onChange={(event) => setInventoryCategory(event.target.value)}>
+                  <option value="TODAS">Todas</option>
+                  {inventoryCategories.map((category) => <option key={category} value={category}>{category}</option>)}
+                </select>
+              </label>
+              <label>Ubicación
+                <select value={inventoryLocation} onChange={(event) => setInventoryLocation(event.target.value)}>
+                  <option value="TODAS">Todas</option>
+                  {inventoryLocations.map((location) => <option key={location} value={location}>{location}</option>)}
+                </select>
+              </label>
+              <label>Disponibilidad
+                <select value={inventoryAvailability} onChange={(event) => setInventoryAvailability(event.target.value)}>
+                  <option value="TODAS">Todas</option>
+                  <option value="DISPONIBLE">Disponible</option>
+                  <option value="BAJO">Stock bajo</option>
+                  <option value="SIN">Sin stock</option>
+                </select>
+              </label>
+              <label>Ordenar
+                <select value={inventorySort} onChange={(event) => setInventorySort(event.target.value)}>
+                  <option value="name">Nombre</option>
+                  <option value="stock">Cantidad</option>
+                  <option value="price">Precio</option>
+                </select>
+              </label>
+              <button className="secondary" type="button" onClick={() => {
+                setInventorySearch("");
+                setInventoryCategory("TODAS");
+                setInventoryLocation("TODAS");
+                setInventoryAvailability("TODAS");
+                setInventorySort("name");
+              }}>Limpiar</button>
+            </div>
+
+            <div className="inventory-view-switch">
+              <button className={!showArchived ? "active" : ""} type="button" onClick={() => setShowArchived(false)}>Productos activos</button>
+              <button className={showArchived ? "active" : ""} type="button" onClick={() => setShowArchived(true)}>Productos archivados ({inventoryArchivedParts.length})</button>
+            </div>
+
+            <article className="panel-card inventory-table-card">
+              <div className="table-wrap">
+                <table className="inventory-table">
+                  <thead><tr><th>Producto</th><th>Categoría</th><th>Ubicación</th><th>Existencias</th><th>Mínimo</th><th>Estado</th><th>Costo</th><th>Precio</th><th>Acciones</th></tr></thead>
+                  <tbody>
+                    {inventoryVisibleParts.map((part) => {
+                      const availability = part.stock === 0 ? "SIN STOCK" : part.stock <= part.minimum_stock ? "STOCK BAJO" : "DISPONIBLE";
+                      return (
+                        <tr key={part.id}>
+                          <td><button className="product-link" type="button" onClick={() => openPartDetail(part)}><strong>{part.name}</strong><small>{part.sku}</small></button></td>
+                          <td>{part.category ?? "Sin categoría"}</td>
+                          <td>{part.location ?? "Sin ubicación"}</td>
+                          <td>
+                            <div className="stock-stepper">
+                              <button type="button" aria-label={`Descontar una unidad de ${part.name}`} disabled={busyPartId === part.id || part.stock === 0 || part.status !== "ACTIVO"} onClick={() => void quickStock(part, "OUT")}>−</button>
+                              <strong>{part.stock}</strong>
+                              <button type="button" aria-label={`Agregar una unidad a ${part.name}`} disabled={busyPartId === part.id || part.status !== "ACTIVO"} onClick={() => void quickStock(part, "IN")}>+</button>
+                            </div>
+                          </td>
+                          <td>{part.minimum_stock}</td>
+                          <td><span className={`stock-status ${availability === "SIN STOCK" ? "out" : availability === "STOCK BAJO" ? "low" : "available"}`}>{availability}</span></td>
+                          <td>{formatMoney(part.cost_minor)}</td>
+                          <td>{formatMoney(part.sale_price_minor)}</td>
+                          <td><div className="row-actions"><button className="secondary" type="button" onClick={() => adjustToFinal(part)} disabled={part.status !== "ACTIVO"}>Ajustar</button><button className="secondary" type="button" onClick={() => openPartDetail(part)}>Detalle</button></div></td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {!inventoryVisibleParts.length && <p className="empty">No hay productos que coincidan con los filtros.</p>}
             </article>
-            <article className="panel-card">
-              <h2>Existencias</h2>
-              <div className="table-wrap"><table><thead><tr><th>SKU</th><th>Repuesto</th><th>Stock</th><th>Precio</th><th>Acciones</th></tr></thead><tbody>
-                {parts.map(part => <tr key={part.id}><td>{part.sku}</td><td>{part.name}</td><td><strong>{part.stock}</strong></td><td>{formatMoney(part.sale_price_minor)}</td><td><div className="row-actions"><button className="secondary" type="button" onClick={() => adjustPart(part.id, "IN")}>Entrada</button><button className="secondary" type="button" onClick={() => adjustPart(part.id, "OUT")}>Salida</button></div></td></tr>)}
-              </tbody></table></div>
-            </article>
+
+            {showProductForm && (
+              <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="new-product-title">
+                <article className="modal-card">
+                  <div className="detail-heading"><h2 id="new-product-title">Nuevo producto</h2><button className="overlay-close-inline" type="button" onClick={() => setShowProductForm(false)}>×</button></div>
+                  <form className="form form-grid inventory-product-form" onSubmit={async (event) => {
+                    await submitPart(event);
+                    setShowProductForm(false);
+                  }}>
+                    <label>SKU<input name="sku" required /></label>
+                    <label>Nombre<input name="name" required /></label>
+                    <label>Categoría<input name="category" /></label>
+                    <label>Ubicación<input name="location" /></label>
+                    <label>Costo ($)<input name="cost" type="number" min="0" step="0.01" required /></label>
+                    <label>Precio ($)<input name="price" type="number" min="0" step="0.01" required /></label>
+                    <label>Stock inicial<input name="initialStock" type="number" min="0" step="1" defaultValue="0" required /></label>
+                    <label>Stock mínimo<input name="minimum" type="number" min="0" defaultValue="0" required /></label>
+                    <button className="primary" type="submit" disabled={busy}>Guardar producto</button>
+                  </form>
+                </article>
+              </div>
+            )}
+
+            {showMovementForm && (
+              <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="movement-title">
+                <article className="modal-card">
+                  <div className="detail-heading"><h2 id="movement-title">Registrar movimiento</h2><button className="overlay-close-inline" type="button" onClick={() => setShowMovementForm(false)}>×</button></div>
+                  <form className="form" onSubmit={async (event) => {
+                    event.preventDefault();
+                    const form = new FormData(event.currentTarget);
+                    const partId = String(form.get("partId"));
+                    const quantity = Number(form.get("quantity"));
+                    await adjustPart(partId, String(form.get("kind")) as "IN" | "OUT", quantity);
+                    setShowMovementForm(false);
+                  }}>
+                    <label>Producto
+                      <select name="partId" required><option value="">Seleccionar</option>{inventoryActiveParts.map((part) => <option key={part.id} value={part.id}>{part.name} · {part.sku}</option>)}</select>
+                    </label>
+                    <label>Tipo<select name="kind"><option value="IN">Entrada</option><option value="OUT">Salida</option></select></label>
+                    <label>Cantidad<input name="quantity" type="number" min="1" defaultValue="1" required /></label>
+                    <button className="primary" type="submit" disabled={busy}>Registrar</button>
+                  </form>
+                </article>
+              </div>
+            )}
+
+            {selectedPart && (
+              <aside className="inventory-drawer" aria-label={`Detalle de ${selectedPart.name}`}>
+                <div className="detail-heading"><div><p className="eyebrow">Detalle del producto</p><h2>{selectedPart.name}</h2></div><button className="overlay-close-inline" type="button" onClick={() => setSelectedPart(null)}>×</button></div>
+                <p className="drawer-sku">{selectedPart.sku}</p>
+                <div className="drawer-stock"><span>Existencias actuales</span><strong>{selectedPart.stock}</strong></div>
+                <dl className="drawer-details">
+                  <dt>Categoría</dt><dd>{selectedPart.category ?? "Sin categoría"}</dd>
+                  <dt>Ubicación</dt><dd>{selectedPart.location ?? "Sin ubicación"}</dd>
+                  <dt>Stock mínimo</dt><dd>{selectedPart.minimum_stock}</dd>
+                  <dt>Costo</dt><dd>{formatMoney(selectedPart.cost_minor)}</dd>
+                  <dt>Precio</dt><dd>{formatMoney(selectedPart.sale_price_minor)}</dd>
+                  <dt>Estado</dt><dd>{selectedPart.status}</dd>
+                  <dt>Último movimiento</dt><dd>{movements[0] ? new Date(movements[0].created_at).toLocaleString("es-AR") : "Sin movimientos"}</dd>
+                </dl>
+                <div className="drawer-actions">
+                  <button className="secondary" type="button" onClick={() => void editPart(selectedPart)}>Editar producto</button>
+                  <button className="secondary" type="button" onClick={() => void quickStock(selectedPart, "IN")} disabled={selectedPart.status !== "ACTIVO"}>Entrada +1</button>
+                  <button className="secondary" type="button" onClick={() => void quickStock(selectedPart, "OUT")} disabled={selectedPart.stock === 0 || selectedPart.status !== "ACTIVO"}>Salida −1</button>
+                  <button className="primary" type="button" onClick={() => void adjustToFinal(selectedPart)} disabled={selectedPart.status !== "ACTIVO"}>Ajustar existencias</button>
+                  {selectedPart.status === "ARCHIVADO"
+                    ? <button className="secondary" type="button" onClick={() => void changePartStatus(selectedPart, "ACTIVO")}>Reactivar</button>
+                    : <button className="danger" type="button" onClick={() => void changePartStatus(selectedPart, "ARCHIVADO")}>Archivar producto</button>}
+                </div>
+                <div className="drawer-history">
+                  <h3>Movimientos</h3>
+                  {movements.slice(0, 10).map((movement) => (
+                    <div className="movement-row" key={movement.id}>
+                      <span>{movement.kind.replaceAll("_", " ")}</span>
+                      <strong>{movement.quantity}</strong>
+                      <small>{movement.stock_before ?? "—"} → {movement.stock_after ?? "—"} · {new Date(movement.created_at).toLocaleString("es-AR")}</small>
+                    </div>
+                  ))}
+                  {!movements.length && <p className="empty">Sin movimientos registrados.</p>}
+                </div>
+              </aside>
+            )}
+
+            {showHistory && (
+              <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="history-title">
+                <article className="modal-card history-modal">
+                  <div className="detail-heading"><h2 id="history-title">Historial de movimientos</h2><button className="overlay-close-inline" type="button" onClick={() => setShowHistory(false)}>×</button></div>
+                  <div className="history-filter">
+                    <label>Tipo
+                      <select value={historyKind} onChange={(event) => setHistoryKind(event.target.value)}>
+                        <option value="TODOS">Todos</option>
+                        <option value="IN">Entradas</option>
+                        <option value="OUT">Salidas</option>
+                        <option value="ADJUSTMENT_IN">Ajustes de entrada</option>
+                        <option value="ADJUSTMENT_OUT">Ajustes de salida</option>
+                        <option value="RETURN">Devoluciones</option>
+                      </select>
+                    </label>
+                    <button className="secondary" type="button" onClick={() => void loadInventoryHistory()}>Aplicar</button>
+                  </div>
+                  <div className="table-wrap"><table><thead><tr><th>Fecha</th><th>Producto</th><th>Tipo</th><th>Cantidad</th><th>Anterior</th><th>Posterior</th><th>Motivo</th><th>Orden</th><th>Acción</th></tr></thead><tbody>
+                    {movements.map((movement) => <tr key={movement.id}><td>{new Date(movement.created_at).toLocaleString("es-AR")}</td><td>{movement.part_name ?? "Producto"}<br /><small>{movement.sku ?? ""}</small></td><td>{movement.kind.replaceAll("_", " ")}</td><td>{movement.quantity}</td><td>{movement.stock_before ?? "—"}</td><td>{movement.stock_after ?? "—"}</td><td>{movement.reason}</td><td>{movement.order_id ?? "—"}</td><td>{movement.reference?.startsWith("reverse:") ? <span className="empty">Reversión</span> : <button className="secondary" type="button" onClick={() => void reverseMovement(movement)}>Revertir</button>}</td></tr>)}
+                  </tbody></table></div>
+                </article>
+              </div>
+            )}
           </section>
         )}
 

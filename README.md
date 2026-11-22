@@ -26,6 +26,12 @@ Mientras el modo público esté activo, terceros pueden utilizar las operaciones
 Las órdenes muestran detalle completo, relación con cliente/equipo, recepción, observaciones, accesorios, estado, técnico y presupuesto. Los registros vacíos pueden corregirse o eliminarse con protección; una orden con historial asociado no se elimina para preservar trazabilidad.
 
 El stock se calcula exclusivamente desde movimientos de inventario. Al crear un repuesto puede registrarse el stock inicial como movimiento `IN`; las entradas y salidas posteriores se registran como movimientos trazables. Los repuestos existentes sin movimientos conservan el stock calculado disponible y no reciben cantidades inventadas automáticamente.
+
+## Inventory 2.0
+
+El módulo Inventario permite operaciones rápidas de una unidad, ajustes manuales con motivo, filtros, detalle lateral, archivo/reactivación e historial de movimientos. Los movimientos incluyen referencia única, stock anterior y posterior.
+
+Las modificaciones de inventario requieren una sesión aprobada. El acceso público temporal conserva solamente consultas generales y no sustituye autorización para administrar productos o stock.
 ## Despliegue (Cloudflare)
 
 La aplicación está desplegada en Cloudflare Workers: [https://group-repair.lucaslean1806.workers.dev/](https://group-repair.lucaslean1806.workers.dev/).

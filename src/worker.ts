@@ -668,7 +668,7 @@ export default {
             SELECT p.id,p.sku,p.name,p.minimum_stock,
               COALESCE(SUM(CASE WHEN sm.kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN sm.quantity ELSE -sm.quantity END),0) AS stock
             FROM parts p LEFT JOIN stock_movements sm ON sm.part_id=p.id
-            WHERE p.workshop_id=?1 GROUP BY p.id HAVING stock <= p.minimum_stock
+            WHERE p.workshop_id=?1 AND p.status='ACTIVO' GROUP BY p.id HAVING stock <= p.minimum_stock
           `).bind(WORKSHOP_ID).all(),
           env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN kind='REFUND' THEN -amount_minor ELSE amount_minor END),0) AS total FROM payment_transactions WHERE workshop_id=?1").bind(WORKSHOP_ID).first<number>("total")
         ]);
@@ -950,30 +950,40 @@ export default {
 
       if (url.pathname === "/api/parts" && request.method === "GET") {
         const result = await env.DB.prepare(`
-          SELECT p.id,p.sku,p.name,p.location,p.cost_minor,p.sale_price_minor,p.minimum_stock,
+          SELECT p.id,p.sku,p.name,p.category,p.location,p.cost_minor,p.sale_price_minor,p.minimum_stock,
+                 p.status,p.archived_at,p.created_at,p.updated_at,
             COALESCE(SUM(CASE WHEN sm.kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN sm.quantity ELSE -sm.quantity END),0) AS stock
           FROM parts p LEFT JOIN stock_movements sm ON sm.part_id=p.id
-          WHERE p.workshop_id=?1 GROUP BY p.id ORDER BY p.name
+          WHERE p.workshop_id=?1 GROUP BY p.id ORDER BY
+            CASE WHEN p.status='ACTIVO' THEN 0 ELSE 1 END,
+            p.name
         `).bind(WORKSHOP_ID).all();
         return json({ parts: result.results });
       }
 
       if (url.pathname === "/api/parts" && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para administrar inventario" }, 401);
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para administrar inventario" }, 401);
         const body = await readJson(request);
         const id = uuid();
         const timestamp = now();
         const initialStock = integer(body.initialStock ?? 0, "Stock inicial");
         if (initialStock < 0) throw new Error("El stock inicial no puede ser negativo");
+        const sku = text(body.sku, "SKU").toUpperCase();
+        const existingSku = await env.DB.prepare(
+          "SELECT id FROM parts WHERE workshop_id=?1 AND sku=?2"
+        ).bind(WORKSHOP_ID, sku).first("id");
+        if (existingSku) return json({ error: "Ya existe un producto con ese SKU" }, 409);
         const statements = [
           env.DB.prepare(
-            "INSERT INTO parts (id,workshop_id,sku,name,location,cost_minor,sale_price_minor,minimum_stock,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
-          ).bind(id, WORKSHOP_ID, text(body.sku, "SKU"), text(body.name, "Nombre"), body.location ? text(body.location, "Ubicación") : null, integer(body.costMinor, "Costo"), integer(body.salePriceMinor, "Precio"), integer(body.minimumStock ?? 0, "Stock mínimo"), timestamp)
+            "INSERT INTO parts (id,workshop_id,sku,name,category,location,cost_minor,sale_price_minor,minimum_stock,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'ACTIVO',?10,?11)"
+          ).bind(id, WORKSHOP_ID, sku, text(body.name, "Nombre"), body.category ? text(body.category, "Categoría") : null, body.location ? text(body.location, "Ubicación") : null, integer(body.costMinor, "Costo"), integer(body.salePriceMinor, "Precio"), integer(body.minimumStock ?? 0, "Stock mínimo"), timestamp, timestamp)
         ];
         if (initialStock > 0) {
           statements.push(
             env.DB.prepare(
-              "INSERT INTO stock_movements (id,workshop_id,part_id,order_id,kind,quantity,reason,actor_id,created_at) VALUES (?1,?2,?3,NULL,'IN',?4,'Stock inicial registrado',NULL,?5)"
-            ).bind(uuid(), WORKSHOP_ID, id, initialStock, timestamp)
+              "INSERT INTO stock_movements (id,workshop_id,part_id,order_id,kind,quantity,reason,actor_id,created_at,stock_before,stock_after,reference) VALUES (?1,?2,?3,NULL,'IN',?4,'Stock inicial registrado',?5,?6,0,?7,?8)"
+            ).bind(uuid(), WORKSHOP_ID, id, initialStock, authenticatedSession.id, timestamp, initialStock, `initial:${id}`)
           );
         }
         await env.DB.batch(statements);
@@ -983,55 +993,201 @@ export default {
 
       const movementMatch = url.pathname.match(/^\/api\/parts\/([^/]+)\/movements$/);
       if (movementMatch && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para registrar movimientos" }, 401);
         const body = await readJson(request);
         const partId = movementMatch[1];
-        const quantity = integer(body.quantity, "Cantidad");
-        if (quantity <= 0) throw new Error("La cantidad debe ser positiva");
-        const kind = text(body.kind, "Tipo").toUpperCase();
-        const allowed = ["IN", "OUT", "RETURN", "ADJUSTMENT_IN", "ADJUSTMENT_OUT"];
-        if (!allowed.includes(kind)) throw new Error("Tipo de movimiento inválido");
+        const reference = body.reference ? text(body.reference, "Referencia") : null;
+        if (reference) {
+          const existing = await env.DB.prepare(
+            "SELECT id,stock_after FROM stock_movements WHERE reference=?1"
+          ).bind(reference).first<{ id: string; stock_after: number }>();
+          if (existing) return json({ id: existing.id, stock: existing.stock_after, duplicated: true });
+        }
+        const part = await env.DB.prepare(
+          "SELECT id,status FROM parts WHERE id=?1 AND workshop_id=?2"
+        ).bind(partId, WORKSHOP_ID).first<{ id: string; status: string }>();
+        if (!part) return json({ error: "Repuesto no encontrado" }, 404);
+        if (part.status === "ARCHIVADO") return json({ error: "Reactiva el producto antes de registrar movimientos" }, 409);
         const stockRow = await env.DB.prepare(`
           SELECT COALESCE(SUM(CASE WHEN kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN quantity ELSE -quantity END),0) AS stock
           FROM stock_movements WHERE part_id=?1 AND workshop_id=?2
-        `).bind(partId, WORKSHOP_ID).first<{ stock: number }>("stock");
+        `).bind(partId, WORKSHOP_ID).first<{ stock: number }>();
         const stock = stockRow?.stock ?? 0;
-        if (["OUT", "ADJUSTMENT_OUT"].includes(kind) && stock - quantity < 0) {
-          return json({ error: "Stock insuficiente" }, 409);
+        const requestedKind = body.kind ? text(body.kind, "Tipo").toUpperCase() : null;
+        let kind: string;
+        let quantity: number;
+        if (body.targetStock !== undefined) {
+          const targetStock = integer(body.targetStock, "Cantidad final");
+          if (targetStock < 0) throw new Error("La cantidad final no puede ser negativa");
+          if (targetStock === stock) return json({ error: "La cantidad final coincide con el stock actual" }, 409);
+          quantity = Math.abs(targetStock - stock);
+          kind = targetStock > stock ? "ADJUSTMENT_IN" : "ADJUSTMENT_OUT";
+        } else {
+          quantity = integer(body.quantity, "Cantidad");
+          if (quantity <= 0) throw new Error("La cantidad debe ser positiva");
+          kind = requestedKind ?? "OUT";
         }
+        const allowed = ["IN", "OUT", "RETURN", "ADJUSTMENT_IN", "ADJUSTMENT_OUT"];
+        if (!allowed.includes(kind)) throw new Error("Tipo de movimiento inválido");
+        const stockAfter = stock + (["IN", "RETURN", "ADJUSTMENT_IN"].includes(kind) ? quantity : -quantity);
+        if (stockAfter < 0) return json({ error: "Stock insuficiente" }, 409);
         const id = uuid();
-        await env.DB.prepare(
-          "INSERT INTO stock_movements (id,workshop_id,part_id,order_id,kind,quantity,reason,actor_id,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
-        ).bind(id, WORKSHOP_ID, partId, body.orderId ? text(body.orderId, "Orden") : null, kind, quantity, text(body.reason, "Motivo"), null, now()).run();
+        await env.DB.batch([
+          env.DB.prepare(
+            "INSERT INTO stock_movements (id,workshop_id,part_id,order_id,kind,quantity,reason,actor_id,created_at,stock_before,stock_after,reference) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"
+          ).bind(id, WORKSHOP_ID, partId, body.orderId ? text(body.orderId, "Orden") : null, kind, quantity, text(body.reason, "Motivo"), authenticatedSession.id, now(), stock, stockAfter, reference),
+          env.DB.prepare(
+            "UPDATE parts SET updated_at=?1 WHERE id=?2 AND workshop_id=?3"
+          ).bind(now(), partId, WORKSHOP_ID)
+        ]);
         await audit(env.DB, "stock.movement", "stock_movement", id, { kind, quantity });
-        return json({ id }, 201);
+        return json({ id, stockBefore: stock, stockAfter, duplicated: false }, 201);
+      }
+
+      if (url.pathname === "/api/inventory/movements" && request.method === "GET") {
+        const partId = url.searchParams.get("part");
+        const kind = url.searchParams.get("kind");
+        const orderId = url.searchParams.get("order");
+        const conditions = ["sm.workshop_id=?1"];
+        const values: unknown[] = [WORKSHOP_ID];
+        let index = 2;
+        if (partId) {
+          conditions.push(`sm.part_id=?${index++}`);
+          values.push(partId);
+        }
+        if (kind) {
+          conditions.push(`sm.kind=?${index++}`);
+          values.push(kind);
+        }
+        if (orderId) {
+          conditions.push(`sm.order_id=?${index++}`);
+          values.push(orderId);
+        }
+        let statement = env.DB.prepare(`
+          SELECT sm.id,sm.part_id,sm.order_id,sm.kind,sm.quantity,sm.reason,sm.actor_id,
+                 sm.created_at,sm.stock_before,sm.stock_after,sm.reference,
+                 p.sku,p.name AS part_name
+          FROM stock_movements sm
+          JOIN parts p ON p.id=sm.part_id
+          WHERE ${conditions.join(" AND ")}
+          ORDER BY sm.created_at DESC
+          LIMIT 500
+        `);
+        statement = statement.bind(...values);
+        const movements = await statement.all();
+        return json({ movements: movements.results });
+      }
+
+      const movementReverseMatch = url.pathname.match(/^\/api\/inventory\/movements\/([^/]+)\/reverse$/);
+      if (movementReverseMatch && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para revertir movimientos" }, 401);
+        const movementId = movementReverseMatch[1];
+        const original = await env.DB.prepare(`
+          SELECT id,part_id,kind,quantity,reference
+          FROM stock_movements WHERE id=?1 AND workshop_id=?2
+        `).bind(movementId, WORKSHOP_ID).first<{ id: string; part_id: string; kind: string; quantity: number; reference: string | null }>();
+        if (!original) return json({ error: "Movimiento no encontrado" }, 404);
+        const reverseReference = `reverse:${original.id}`;
+        const existing = await env.DB.prepare(
+          "SELECT id,stock_after FROM stock_movements WHERE reference=?1"
+        ).bind(reverseReference).first<{ id: string; stock_after: number }>();
+        if (existing) return json({ id: existing.id, stock: existing.stock_after, duplicated: true });
+        const stockRow = await env.DB.prepare(`
+          SELECT COALESCE(SUM(CASE WHEN kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN quantity ELSE -quantity END),0) AS stock
+          FROM stock_movements WHERE part_id=?1 AND workshop_id=?2
+        `).bind(original.part_id, WORKSHOP_ID).first<{ stock: number }>();
+        const stockBefore = stockRow?.stock ?? 0;
+        const reverseKind = ["OUT", "ADJUSTMENT_OUT"].includes(original.kind) ? "IN" : "OUT";
+        const stockAfter = stockBefore + (reverseKind === "IN" ? original.quantity : -original.quantity);
+        if (stockAfter < 0) return json({ error: "No hay stock suficiente para revertir el movimiento" }, 409);
+        const id = uuid();
+        await env.DB.batch([
+          env.DB.prepare(`
+            INSERT INTO stock_movements
+              (id,workshop_id,part_id,order_id,kind,quantity,reason,actor_id,created_at,stock_before,stock_after,reference)
+            VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,?11)
+          `).bind(
+            id, WORKSHOP_ID, original.part_id, reverseKind, original.quantity,
+            `Reversión compensatoria del movimiento ${original.id}`,
+            authenticatedSession.id, now(), stockBefore, stockAfter, reverseReference
+          ),
+          env.DB.prepare("UPDATE parts SET updated_at=?1 WHERE id=?2 AND workshop_id=?3")
+            .bind(now(), original.part_id, WORKSHOP_ID)
+        ]);
+        await audit(env.DB, "stock.movement.reversed", "stock_movement", original.id, { reverseId: id });
+        return json({ id, stockBefore, stockAfter, reversed: original.id }, 201);
+      }
+
+      const partStatusMatch = url.pathname.match(/^\/api\/parts\/([^/]+)\/status$/);
+      if (partStatusMatch && request.method === "PATCH") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para cambiar el estado" }, 401);
+        const partId = partStatusMatch[1];
+        const body = await readJson(request);
+        const status = text(body.status, "Estado").toUpperCase();
+        if (!["ACTIVO", "INACTIVO", "ARCHIVADO"].includes(status)) {
+          return json({ error: "Estado de producto no válido" }, 400);
+        }
+        const timestamp = now();
+        await env.DB.prepare(`
+          UPDATE parts SET status=?1,archived_at=?2,updated_at=?3
+          WHERE id=?4 AND workshop_id=?5
+        `).bind(status, status === "ARCHIVADO" ? timestamp : null, timestamp, partId, WORKSHOP_ID).run();
+        await audit(env.DB, `part.status_${status.toLowerCase()}`, "part", partId, { status });
+        return json({ status });
       }
 
       const partDetailMatch = url.pathname.match(/^\/api\/parts\/([^/]+)$/);
+      if (partDetailMatch && request.method === "GET") {
+        const partId = partDetailMatch[1];
+        const part = await env.DB.prepare(`
+          SELECT p.id,p.sku,p.name,p.category,p.location,p.cost_minor,p.sale_price_minor,p.minimum_stock,
+                 p.status,p.archived_at,p.created_at,p.updated_at,
+                 COALESCE(SUM(CASE WHEN sm.kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN sm.quantity ELSE -sm.quantity END),0) AS stock
+          FROM parts p LEFT JOIN stock_movements sm ON sm.part_id=p.id
+          WHERE p.id=?1 AND p.workshop_id=?2 GROUP BY p.id
+        `).bind(partId, WORKSHOP_ID).first();
+        if (!part) return json({ error: "Repuesto no encontrado" }, 404);
+        const movements = await env.DB.prepare(`
+          SELECT id,order_id,kind,quantity,reason,actor_id,created_at,stock_before,stock_after,reference
+          FROM stock_movements WHERE part_id=?1 AND workshop_id=?2
+          ORDER BY created_at DESC LIMIT 100
+        `).bind(partId, WORKSHOP_ID).all();
+        return json({ part, movements: movements.results });
+      }
+
       if (partDetailMatch && request.method === "PATCH") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para editar inventario" }, 401);
         const partId = partDetailMatch[1];
         const body = await readJson(request);
         const part = await env.DB.prepare(
           "SELECT id FROM parts WHERE id=?1 AND workshop_id=?2"
         ).bind(partId, WORKSHOP_ID).first("id");
         if (!part) return json({ error: "Repuesto no encontrado" }, 404);
+        const sku = text(body.sku, "SKU").toUpperCase();
+        const duplicateSku = await env.DB.prepare(
+          "SELECT id FROM parts WHERE workshop_id=?1 AND sku=?2 AND id<>?3"
+        ).bind(WORKSHOP_ID, sku, partId).first("id");
+        if (duplicateSku) return json({ error: "Ya existe un producto con ese SKU" }, 409);
         await env.DB.prepare(`
           UPDATE parts SET
-            sku=?1,name=?2,location=?3,cost_minor=?4,sale_price_minor=?5,minimum_stock=?6
-          WHERE id=?7 AND workshop_id=?8
+            sku=?1,name=?2,category=?3,location=?4,cost_minor=?5,sale_price_minor=?6,minimum_stock=?7,updated_at=?8
+          WHERE id=?9 AND workshop_id=?10
         `).bind(
-          text(body.sku, "SKU"),
+          sku,
           text(body.name, "Nombre"),
+          body.category ? text(body.category, "Categoría") : null,
           body.location ? text(body.location, "Ubicación") : null,
           integer(body.costMinor, "Costo"),
           integer(body.salePriceMinor, "Precio"),
           integer(body.minimumStock ?? 0, "Stock mínimo"),
-          partId, WORKSHOP_ID
+          now(), partId, WORKSHOP_ID
         ).run();
         await audit(env.DB, "part.updated", "part", partId);
         return json({ ok: true });
       }
 
       if (partDetailMatch && request.method === "DELETE") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para eliminar inventario" }, 401);
         const partId = partDetailMatch[1];
         const movements = await env.DB.prepare(
           "SELECT COUNT(*) AS count FROM stock_movements WHERE part_id=?1 AND workshop_id=?2"
