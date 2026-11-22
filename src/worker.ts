@@ -187,6 +187,23 @@ export default {
             "SELECT COUNT(*) AS count FROM users WHERE role='admin' AND status='APPROVED' AND deactivated_at IS NULL"
           ).bind().first<number>("count");
           const isBootstrapAdmin = Boolean(env.GOOGLE_BOOTSTRAP_SUB && env.GOOGLE_BOOTSTRAP_SUB === payload.sub && activeAdmins === 0);
+          const allowlistEntry = await env.DB.prepare(
+            "SELECT id FROM google_access_allowlist WHERE workshop_id=?1 AND status='ACTIVE' AND (google_sub=?2 OR email=?3)"
+          ).bind(WORKSHOP_ID, payload.sub, payload.email).first("id");
+          const isAllowlisted = Boolean(allowlistEntry);
+          const canCreateApproved = isBootstrapAdmin || (activeAdmins !== 0 && isAllowlisted);
+          const isInitialBootstrap = activeAdmins === 0 && !env.GOOGLE_BOOTSTRAP_SUB;
+
+          if (activeAdmins !== 0 && !isBootstrapAdmin && !isAllowlisted) {
+            return json({ error: "Cuenta Google no autorizada por el administrador" }, 403);
+          }
+          if (activeAdmins === 0 && env.GOOGLE_BOOTSTRAP_SUB && !isBootstrapAdmin) {
+            return json({ error: "Cuenta Google no autorizada para el aprovisionamiento inicial" }, 403);
+          }
+          if (activeAdmins === 0 && isInitialBootstrap) {
+            // The first verified Google account remains pending until GOOGLE_BOOTSTRAP_SUB is configured.
+          }
+
           await env.DB.prepare(
             "INSERT INTO users (id,workshop_id,name,email,role,status,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)"
           ).bind(
@@ -194,8 +211,8 @@ export default {
             WORKSHOP_ID,
             payload.name?.trim() || payload.email,
             payload.email,
-            isBootstrapAdmin ? "admin" : "viewer",
-            isBootstrapAdmin ? "APPROVED" : "PENDING",
+            canCreateApproved && isBootstrapAdmin ? "admin" : "viewer",
+            canCreateApproved ? "APPROVED" : "PENDING",
             timestamp
           ).run();
           await env.DB.prepare(
@@ -205,6 +222,11 @@ export default {
             "SELECT id,workshop_id,name,email,role,status,deactivated_at FROM users WHERE id=?1"
           ).bind(userId).first<SessionUser & { deactivated_at: string | null }>();
           if (!user) return json({ error: "No se pudo crear la cuenta" }, 500);
+          if (allowlistEntry) {
+            await env.DB.prepare(
+              "UPDATE google_access_allowlist SET google_sub=?1,updated_at=?2 WHERE id=?3"
+            ).bind(payload.sub, timestamp, allowlistEntry).run();
+          }
         } else {
           await env.DB.prepare(
             "INSERT OR IGNORE INTO google_identities (id,user_id,google_sub,email,email_verified,created_at) VALUES (?1,?2,?3,?4,?5,?6)"
@@ -231,7 +253,8 @@ export default {
         ).run();
 
         return new Response(JSON.stringify({
-          user: { id: user.id, name: user.name, email: user.email, role: user.role, status: user.status }
+          user: { id: user.id, name: user.name, email: user.email, role: user.role, status: user.status },
+          googleSub: payload.sub
         }), {
           status: 200,
           headers: {
@@ -244,7 +267,13 @@ export default {
       if (url.pathname === "/api/auth/me" && request.method === "GET") {
         const session = await getSession(env.DB, request);
         if (!session) return json({ user: null });
-        return json({ user: { id: session.id, name: session.name, email: session.email, role: session.role, status: session.status } });
+        const identity = await env.DB.prepare(
+          "SELECT google_sub FROM google_identities WHERE user_id=?1 LIMIT 1"
+        ).bind(session.id).first<{ google_sub: string }>();
+        return json({
+          user: { id: session.id, name: session.name, email: session.email, role: session.role, status: session.status },
+          googleSub: identity?.google_sub ?? null
+        });
       }
 
       if (url.pathname === "/api/auth/logout" && request.method === "POST") {
@@ -295,6 +324,42 @@ export default {
           await env.DB.prepare("UPDATE users SET status='DEACTIVATED',deactivated_at=?1 WHERE id=?2 AND workshop_id=?3").bind(now(), userId, WORKSHOP_ID).run();
         }
         await audit(env.DB, `user.${action}`, "user", userId);
+        return json({ ok: true });
+      }
+
+      if (url.pathname === "/api/admin/google-accounts" && request.method === "GET") {
+        if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
+        const accounts = await env.DB.prepare(
+          "SELECT id,email,google_sub,status,created_at,updated_at FROM google_access_allowlist WHERE workshop_id=?1 ORDER BY created_at DESC"
+        ).bind(WORKSHOP_ID).all();
+        return json({ accounts: accounts.results });
+      }
+
+      if (url.pathname === "/api/admin/google-accounts" && request.method === "POST") {
+        if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
+        const body = await readJson(request);
+        const email = text(body.email, "Email").toLowerCase();
+        const googleSub = body.googleSub ? text(body.googleSub, "Google sub") : null;
+        const id = uuid();
+        await env.DB.prepare(`
+          INSERT INTO google_access_allowlist (id,workshop_id,google_sub,email,status,created_by,created_at,updated_at)
+          VALUES (?1,?2,?3,?4,'ACTIVE',?5,?6,?7)
+          ON CONFLICT(workshop_id,email) DO UPDATE SET
+            google_sub=COALESCE(excluded.google_sub,google_access_allowlist.google_sub),
+            status='ACTIVE',updated_at=excluded.updated_at
+        `).bind(id, WORKSHOP_ID, googleSub, email, authenticatedSession.id, now(), now()).run();
+        await audit(env.DB, "google_account.allowlisted", "google_account", id, { email, googleSub: Boolean(googleSub) });
+        return json({ ok: true }, 201);
+      }
+
+      const allowlistDelete = url.pathname.match(/^\/api\/admin\/google-accounts\/([^/]+)$/);
+      if (allowlistDelete && request.method === "DELETE") {
+        if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
+        const accountId = allowlistDelete[1];
+        await env.DB.prepare(
+          "DELETE FROM google_access_allowlist WHERE id=?1 AND workshop_id=?2"
+        ).bind(accountId, WORKSHOP_ID).run();
+        await audit(env.DB, "google_account.removed", "google_account", accountId);
         return json({ ok: true });
       }
 

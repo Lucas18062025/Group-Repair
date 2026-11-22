@@ -67,6 +67,8 @@ th { color: #7a8497; font-size: 12px; text-transform: uppercase; letter-spacing:
 .auth-logo { width: 154px; height: auto; max-height: 86px; object-fit: contain; }
 .google-signin { min-height: 44px; display: grid; place-items: center; }
 .pending-card .primary { width: 100%; }
+.google-sub-box { width: 100%; display: grid; gap: 6px; border: 1px solid #e5e9f1; border-radius: 8px; background: #f8fafc; padding: 12px; text-align: left; }
+.google-sub-box code { overflow-wrap: anywhere; color: #172033; font-size: 13px; }
 .integration-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-bottom: 16px; }
 .integration-card { display: flex; flex-direction: column; gap: 12px; }
 .integration-card h2 { margin-bottom: 6px; }
@@ -76,6 +78,8 @@ th { color: #7a8497; font-size: 12px; text-transform: uppercase; letter-spacing:
 .integration-status.connected { background: #e7f6f1; color: #176c5d; }
 .integration-error { color: #a84f35 !important; }
 .admin-users { margin-top: 16px; }
+.allowlist-form { grid-template-columns: 1fr 1fr auto; align-items: end; margin-bottom: 16px; }
+.allowlist-form .primary { width: 100%; }
 .gemini-card textarea { min-height: 140px; resize: vertical; border: 1px solid #ccd3df; border-radius: 8px; padding: 10px; color: #172033; }
 .gemini-answer { margin-top: 18px; border: 1px solid #e5e9f1; border-radius: 10px; background: #f8fafc; padding: 16px; white-space: pre-wrap; }
 .gemini-answer p { line-height: 1.65; }
@@ -91,6 +95,7 @@ th { color: #7a8497; font-size: 12px; text-transform: uppercase; letter-spacing:
   .metrics { grid-template-columns: repeat(2, 1fr); }
   .grid-two { grid-template-columns: 1fr; }
   .integration-grid { grid-template-columns: 1fr; }
+  .allowlist-form { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 600px) {
