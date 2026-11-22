@@ -201,7 +201,7 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand">
           <img className="brand-mark" src="/Group-Repair.jpg" alt="Logo de Group Repair" />
-          <div><strong>Group Repair</strong><small>Taller técnico</small></div>
+          <div className="brand-text"><strong>Group Repair</strong><small>Taller técnico</small></div>
         </div>
         <nav aria-label="Navegación principal">
           {([
