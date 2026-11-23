@@ -1645,24 +1645,12 @@ export default function App() {
                 </article>
                 <article className="operation-card">
                   <span className="operation-icon" aria-hidden="true">02</span>
-                  <h3>Integraciones</h3>
-                  <p>Google Drive, Sheets, Photos y estado real de cada conexión.</p>
-                  <button className="primary" type="button" onClick={() => setShowIntegrationsPanel(true)}>Abrir integraciones</button>
-                </article>
-                <article className="operation-card">
-                  <span className="operation-icon" aria-hidden="true">03</span>
-                  <h3>Group Repair Intelligence</h3>
-                  <p>{authConfig?.geminiConfigured ? "Gemini configurado y disponible para consultas." : "Gemini pendiente de configuración con GEMINI_API_KEY."}</p>
-                  <button className="primary" type="button" onClick={() => setShowGeminiPanel(true)}>Abrir asistente</button>
-                </article>
-                <article className="operation-card">
-                  <span className="operation-icon" aria-hidden="true">04</span>
                   <h3>Clientes</h3>
                   <p>Administrar clientes y vincular equipos y órdenes de reparación.</p>
                   <button className="primary" type="button" onClick={() => navigateTab("clientes")}>Gestionar clientes</button>
                 </article>
                 <article className="operation-card">
-                  <span className="operation-icon" aria-hidden="true">05</span>
+                  <span className="operation-icon" aria-hidden="true">03</span>
                   <h3>Inventario</h3>
                   <p>Componentes, repuestos, existencias y alertas de stock.</p>
                   <button className="primary" type="button" onClick={() => navigateTab("inventario")}>Abrir inventario</button>
