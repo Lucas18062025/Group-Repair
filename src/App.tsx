@@ -1666,7 +1666,7 @@ export default function App() {
               </article>
               <article className="panel-card">
                 <h2>Alertas de inventario</h2>
-                {dashboard?.lowStock.length ? dashboard.lowStock.map(part => <div className="stock-alert" key={part.id}><span>{part.name}</span><strong>{part.stock} mín. {part.minimum_stock}</strong></div>) : <p className="empty">No hay alertas de stock.</p>}
+                {dashboard?.lowStock.length ? dashboard.lowStock.map(part => <div className="stock-alert" key={part.id}><span>{part.name}</span><strong>{part.stock} de {part.minimum_stock}</strong></div>) : <p className="empty">No hay alertas de stock.</p>}
               </article>
               <article className="panel-card storage-card">
                 <h2>Persistencia de datos</h2>
