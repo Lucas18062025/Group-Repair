@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { formatDateTimeDisplay, formatDateTimeLocal } from "./domain/dates";
 
-type Tab = "panel" | "clientes" | "equipos" | "ordenes" | "inventario" | "integraciones" | "gemini" | "asistencia";
+type Tab = "panel" | "clientes" | "equipos" | "ordenes" | "inventario" | "asistencia";
 
 declare global {
   interface Window {
@@ -206,7 +206,7 @@ function statusLabel(status: string): string {
 export default function App() {
   const initialTab = new URLSearchParams(window.location.search).get("tab");
   const [tab, setTab] = useState<Tab>(
-    ["panel", "clientes", "equipos", "ordenes", "inventario", "integraciones", "gemini", "asistencia"].includes(initialTab ?? "")
+    ["panel", "clientes", "equipos", "ordenes", "inventario", "asistencia"].includes(initialTab ?? "")
       ? (initialTab as Tab)
       : "panel"
   );
@@ -220,6 +220,8 @@ export default function App() {
   const [googleSub, setGoogleSub] = useState<string | null>(null);
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
   const [integrations, setIntegrations] = useState<IntegrationConnection[]>([]);
+  const [showIntegrationsPanel, setShowIntegrationsPanel] = useState(false);
+  const [showGeminiPanel, setShowGeminiPanel] = useState(false);
   const [geminiPrompt, setGeminiPrompt] = useState("");
   const [geminiAnswer, setGeminiAnswer] = useState("");
   const [adminUsers, setAdminUsers] = useState<AuthUser[]>([]);
@@ -302,12 +304,14 @@ export default function App() {
         const params = new URLSearchParams(window.location.search);
         if (params.get("integration_error") === "google") {
           setMessage("Google denegó la autorización. En modo Testing, agrega la cuenta como Test User o publica/verifica el proyecto.");
-          window.history.replaceState({}, "", "/?tab=integraciones");
+          window.history.replaceState({}, "", "/?tab=panel");
+          setShowIntegrationsPanel(true);
         } else if (params.get("integration_error") === "auth_required") {
           setMessage("Iniciá sesión para completar la autorización de Google.");
         } else if (params.get("connected")) {
           setMessage(`Integración ${params.get("connected")} conectada`);
-          window.history.replaceState({}, "", `/?tab=integraciones`);
+          window.history.replaceState({}, "", "/?tab=panel");
+          setShowIntegrationsPanel(true);
         }
         const [config, me] = await Promise.all([
           api<AuthConfig>("/api/auth/config"),
@@ -408,7 +412,7 @@ export default function App() {
   useEffect(() => {
     const syncTab = () => {
       const route = new URLSearchParams(window.location.search).get("tab");
-      if (route && ["panel", "clientes", "equipos", "ordenes", "inventario", "integraciones", "gemini", "asistencia"].includes(route)) {
+      if (route && ["panel", "clientes", "equipos", "ordenes", "inventario", "asistencia"].includes(route)) {
         setTab(route as Tab);
       }
     };
@@ -440,11 +444,11 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (authUser?.status === "APPROVED" && tab === "integraciones") void loadIntegrations();
-  }, [tab, authUser]);
+    if (authUser?.status === "APPROVED" && showIntegrationsPanel) void loadIntegrations();
+  }, [showIntegrationsPanel, authUser]);
 
   useEffect(() => {
-    if (authUser?.status === "APPROVED" && authUser.role === "admin" && tab === "integraciones") {
+    if (authUser?.status === "APPROVED" && authUser.role === "admin" && showIntegrationsPanel) {
       void Promise.all([
         api<{ users: AuthUser[] }>("/api/admin/users"),
         api<{ accounts: GoogleAllowlistAccount[] }>("/api/admin/google-accounts")
@@ -455,7 +459,7 @@ export default function App() {
         })
         .catch((error) => setMessage(error instanceof Error ? error.message : "No se pudieron cargar usuarios"));
     }
-  }, [tab, authUser]);
+  }, [showIntegrationsPanel, authUser]);
 
   useEffect(() => {
     if (authUser?.status === "APPROVED" && ["admin", "reception", "technical_lead"].includes(authUser.role) && tab === "asistencia") {
@@ -1591,8 +1595,6 @@ export default function App() {
             ["equipos", "Equipos"],
             ["ordenes", "Órdenes"],
             ["inventario", "Inventario"],
-            ["integraciones", "Integraciones"],
-            ["gemini", "Inteligencia"],
             ["asistencia", "Asistencia"]
           ] as Array<[Tab, string]>).map(([key, label]) => (
             <button key={key} className={tab === key ? "active" : ""} onClick={() => navigateTab(key)}>{label}</button>
@@ -1602,7 +1604,7 @@ export default function App() {
 
       <main>
         <header className="topbar">
-          <div><p className="eyebrow">Gestión operativa</p><h1>{tab === "panel" ? "Panel general" : tab === "gemini" ? "Group Repair Intelligence" : tab === "asistencia" ? "Asistencia / Conversaciones" : tab[0].toUpperCase() + tab.slice(1)}</h1></div>
+          <div><p className="eyebrow">Gestión operativa</p><h1>{tab === "panel" ? "Panel general" : tab === "asistencia" ? "Asistencia / Conversaciones" : tab[0].toUpperCase() + tab.slice(1)}</h1></div>
           <div className="topbar-actions">
             {busy && <span className="loading">Actualizando</span>}
             {authUser?.status === "APPROVED" ? (
@@ -1645,13 +1647,13 @@ export default function App() {
                   <span className="operation-icon" aria-hidden="true">02</span>
                   <h3>Integraciones</h3>
                   <p>Google Drive, Sheets, Photos y estado real de cada conexión.</p>
-                  <button className="primary" type="button" onClick={() => navigateTab("integraciones")}>Abrir integraciones</button>
+                  <button className="primary" type="button" onClick={() => setShowIntegrationsPanel(true)}>Abrir integraciones</button>
                 </article>
                 <article className="operation-card">
                   <span className="operation-icon" aria-hidden="true">03</span>
                   <h3>Group Repair Intelligence</h3>
                   <p>{authConfig?.geminiConfigured ? "Gemini configurado y disponible para consultas." : "Gemini pendiente de configuración con GEMINI_API_KEY."}</p>
-                  <button className="primary" type="button" onClick={() => navigateTab("gemini")}>Abrir asistente</button>
+                  <button className="primary" type="button" onClick={() => setShowGeminiPanel(true)}>Abrir asistente</button>
                 </article>
                 <article className="operation-card">
                   <span className="operation-icon" aria-hidden="true">04</span>
@@ -2077,8 +2079,11 @@ export default function App() {
           </section>
         )}
 
-        {tab === "integraciones" && (
-          <section className="content">
+        {showIntegrationsPanel && (
+          <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="integrations-panel-title">
+            <article className="modal-card integration-panel-modal">
+              <div className="detail-heading"><h2 id="integrations-panel-title">Integraciones y acceso</h2><button className="overlay-close-inline" type="button" onClick={() => setShowIntegrationsPanel(false)}>×</button></div>
+              <section className="content">
             <div className="integration-grid">
               {([
                 ["google_drive", "Google Drive", "Adjuntar documentación y archivos de órdenes.", "google_drive"],
@@ -2117,7 +2122,7 @@ export default function App() {
                 ) : (
                   <p className="integration-error">Gemini está pendiente de configuración. Es necesario configurar <code>GEMINI_API_KEY</code> en Cloudflare Workers.</p>
                 )}
-                <button className="primary" type="button" onClick={() => navigateTab("gemini")}>Abrir Intelligence</button>
+                <button className="primary" type="button" onClick={() => { setShowIntegrationsPanel(false); setShowGeminiPanel(true); }}>Abrir Intelligence</button>
               </article>
             </div>
 
@@ -2186,7 +2191,9 @@ export default function App() {
                 </article>
               </>
             )}
-          </section>
+              </section>
+            </article>
+          </div>
         )}
 
         {tab === "asistencia" && (
@@ -2234,8 +2241,11 @@ export default function App() {
           </section>
         )}
 
-        {tab === "gemini" && (
-          <section className="content">
+        {showGeminiPanel && (
+          <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="gemini-panel-title">
+            <article className="modal-card gemini-panel-modal">
+              <div className="detail-heading"><h2 id="gemini-panel-title">Group Repair Intelligence</h2><button className="overlay-close-inline" type="button" onClick={() => setShowGeminiPanel(false)}>×</button></div>
+              <section className="content">
             <article className="panel-card gemini-card">
               <h2>Group Repair Intelligence</h2>
               {authConfig?.geminiConfigured ? (
@@ -2250,7 +2260,9 @@ export default function App() {
               )}
               {geminiAnswer && <div className="gemini-answer"><strong>Respuesta</strong><p>{geminiAnswer}</p><small>Asistente técnico: confirmar diagnósticos y operaciones con criterio humano.</small></div>}
             </article>
-          </section>
+              </section>
+            </article>
+          </div>
         )}
         <footer className="author-footer">
           <span>Diseñado por <a href="https://portafolio.lucaslean1806.workers.dev/" target="_blank" rel="noreferrer">Lucas Villagra | Cybersecurity Analyst</a></span>
