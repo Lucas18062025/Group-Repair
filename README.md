@@ -41,7 +41,9 @@ La eliminación de un cliente con dependencias conserva integridad mediante una 
 
 ## Asistente virtual de clientes
 
-El asistente público funciona con respuestas basadas en reglas y puede reutilizar `GEMINI_API_KEY` desde Cloudflare cuando esté configurado. No expone la clave al frontend.
+El asistente público combina clasificación determinista de intenciones, flujos guiados para solicitudes/seguimiento y Gemini opcional. Cuando Gemini está configurado, recupera entradas relevantes activas de `knowledge_base` mediante consultas convencionales de D1, limita y delimita ese contexto como referencia no ejecutable, y aplica un fallback determinista si el proveedor falla o no tiene información suficiente. Esto es grounding por recuperación de registros, no un índice vectorial ni RAG avanzado.
+
+Antes de enviar contexto al proveedor se acotan las entradas, se limita el historial y se redactan teléfonos, emails y referencias públicas. La consulta de órdenes y el registro de solicitudes permanecen en endpoints backend separados, con validación, consentimiento, rate limiting y verificación de teléfono; Gemini no decide autorizaciones ni ejecuta SQL.
 
 Las conversaciones y solicitudes se guardan en D1 con consentimiento, límites de longitud, rate limiting y referencias públicas aleatorias. El seguimiento de órdenes exige número de orden y teléfono coincidente. El personal autorizado revisa solicitudes desde `/?tab=asistencia` y puede convertirlas a órdenes reales sin crear confirmaciones automáticas.
 ## Despliegue (Cloudflare)
