@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type FormEvent } from "react";
 import { formatDateTimeDisplay, formatDateTimeLocal } from "./domain/dates";
 import { ORDER_STATUSES } from "./domain/status";
 
@@ -292,6 +292,8 @@ export default function App() {
   const [googleAccounts, setGoogleAccounts] = useState<GoogleAllowlistAccount[]>([]);
   const [showLoginOverlay, setShowLoginOverlay] = useState(false);
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
+  const [editingOrderId, setEditingOrderId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<Record<string, string>>({});
   const [inventorySearch, setInventorySearch] = useState("");
   const [inventoryCategory, setInventoryCategory] = useState("TODAS");
   const [inventoryLocation, setInventoryLocation] = useState("TODAS");
@@ -1278,18 +1280,19 @@ export default function App() {
       setMessage("Se requiere una sesión aprobada para editar órdenes");
       return;
     }
-    const reportedIssue = window.prompt("Problema informado", order.reported_issue);
-    if (!reportedIssue?.trim()) return;
-    const observations = window.prompt("Observaciones", order.observations ?? "") ?? "";
-    const accessories = window.prompt("Accesorios", order.accessories ?? "") ?? "";
+    const reportedIssue = (editDraft.reportedIssue ?? order.reported_issue).trim();
+    if (!reportedIssue) return;
+    const observations = (editDraft.observations ?? order.observations ?? "").trim();
+    const accessories = (editDraft.accessories ?? order.accessories ?? "").trim();
+    const priority = editDraft.priority ?? order.priority;
     try {
       await api(`/api/orders/${order.id}`, {
         method: "PATCH",
         body: JSON.stringify({
-          reportedIssue: reportedIssue.trim(),
-          observations: observations.trim(),
-          accessories: accessories.trim(),
-          priority: order.priority,
+          reportedIssue,
+          observations,
+          accessories,
+          priority,
           estimatedCompletionAt: null,
           receivedAt: order.received_at ?? order.created_at,
           assignedUserId: null,
@@ -1298,12 +1301,13 @@ export default function App() {
           model: order.model,
           serialNumber: order.serial_number,
           physicalCondition: null,
-          reportedFault: reportedIssue.trim()
+          reportedFault: reportedIssue
         })
       });
       setMessage("Orden actualizada");
       await refresh();
       setSelectedOrder(null);
+      setEditingOrderId(null);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "No se pudo editar la orden");
     }
@@ -1872,7 +1876,14 @@ export default function App() {
                 {orders
                   .filter((order) => orderFilter === "TODAS" || order.status === orderFilter || (orderFilter === "WAITING_FOR_PARTS" && ["WAITING_FOR_PARTS", "QUOTED", "APPROVED"].includes(order.status)) || (orderFilter === "READY_FOR_DELIVERY" && ["TESTING", "READY_FOR_DELIVERY", "NOT_REPAIRABLE"].includes(order.status)))
                   .filter((order) => !orderSearch || `${order.reference} ${order.customer_name} ${order.brand} ${order.model} ${order.reported_issue}`.toLowerCase().includes(orderSearch.toLowerCase()))
-                  .map(order => <tr key={order.id}><td><strong>{order.reference}</strong></td><td>{order.customer_name}<br /><small>{order.customer_phone ?? ""}</small></td><td>{order.brand} {order.model}{order.serial_number ? ` · ${order.serial_number}` : ""}</td><td>{order.received_at ? formatDateTimeDisplay(order.received_at) : formatDateTimeDisplay(order.created_at)}</td><td>
+                  .map(order => (
+                    <Fragment key={order.id}>
+                      <tr>
+                        <td><strong>{order.reference}</strong></td>
+                        <td>{order.customer_name}<br /><small>{order.customer_phone ?? ""}</small></td>
+                        <td>{order.brand} {order.model}{order.serial_number ? ` · ${order.serial_number}` : ""}</td>
+                        <td>{order.received_at ? formatDateTimeDisplay(order.received_at) : formatDateTimeDisplay(order.created_at)}</td>
+                        <td>
   <select
     className={`badge badge-${order.status.toLowerCase()}`}
     value={order.status}
@@ -1883,7 +1894,25 @@ export default function App() {
       <option key={status} value={status}>{statusLabel(status)}</option>
     ))}
   </select>
-</td><td>{order.technician_name ?? "Sin asignar"}</td><td>{formatMoney(order.total_minor ?? 0)}</td><td>{formatDateTimeDisplay(order.created_at)}</td><td><div className="row-actions"><button className="secondary" type="button" onClick={() => openOrder(order)}>Detalle</button><button className="secondary" type="button" onClick={() => editOrder(order)}>Editar</button></div></td></tr>)}
+</td><td>{order.technician_name ?? "Sin asignar"}</td><td>{formatMoney(order.total_minor ?? 0)}</td><td>{formatDateTimeDisplay(order.created_at)}</td><td><div className="row-actions"><button className="secondary" type="button" onClick={() => openOrder(order)}>Detalle</button><button className="secondary" type="button" onClick={() => { setEditingOrderId(order.id); setEditDraft({ reportedIssue: order.reported_issue, observations: order.observations ?? "", accessories: order.accessories ?? "", priority: order.priority }); }}>Editar</button></div></td></tr>
+                       {editingOrderId === order.id && (
+                         <tr className="inline-edit-row">
+                           <td colSpan={9}>
+                             <form className="form form-grid" onSubmit={async (event) => { event.preventDefault(); await editOrder(order); setEditingOrderId(null); }}>
+                               <label>Problema<input value={editDraft.reportedIssue ?? ""} onChange={(e) => setEditDraft((d) => ({ ...d, reportedIssue: e.target.value }))} required /></label>
+                               <label>Prioridad<select value={editDraft.priority ?? "normal"} onChange={(e) => setEditDraft((d) => ({ ...d, priority: e.target.value }))}><option value="normal">Normal</option><option value="alta">Alta</option><option value="urgente">Urgente</option></select></label>
+                               <label>Observaciones<textarea value={editDraft.observations ?? ""} onChange={(e) => setEditDraft((d) => ({ ...d, observations: e.target.value }))} rows={2} /></label>
+                               <label>Accesorios<input value={editDraft.accessories ?? ""} onChange={(e) => setEditDraft((d) => ({ ...d, accessories: e.target.value }))} /></label>
+                               <div className="row-actions">
+                                 <button className="primary" type="submit" disabled={busy}>Guardar</button>
+                                 <button className="secondary" type="button" onClick={() => setEditingOrderId(null)}>Cancelar</button>
+                               </div>
+                             </form>
+                           </td>
+                         </tr>
+                       )}
+                     </Fragment>
+                   ))}
               </tbody></table></div>
               {!orders.length && <p className="empty">Todavía no hay órdenes registradas. Crea la primera desde este módulo.</p>}
             </article>
