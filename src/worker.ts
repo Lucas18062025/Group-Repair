@@ -369,9 +369,10 @@ export default {
           ).bind().first<number>("count");
           const isBootstrapAdmin = Boolean(env.GOOGLE_BOOTSTRAP_SUB && env.GOOGLE_BOOTSTRAP_SUB === payload.sub && activeAdmins === 0);
           const allowlistEntry = await env.DB.prepare(
-            "SELECT id FROM google_access_allowlist WHERE workshop_id=?1 AND status='ACTIVE' AND (google_sub=?2 OR email=?3)"
-          ).bind(WORKSHOP_ID, payload.sub, payload.email).first("id");
+            "SELECT id, role FROM google_access_allowlist WHERE workshop_id=?1 AND status='ACTIVE' AND (google_sub=?2 OR email=?3)"
+          ).bind(WORKSHOP_ID, payload.sub, payload.email).first<{ id: string; role: string | null }>();
           const isAllowlisted = Boolean(allowlistEntry);
+          const allowlistRole = allowlistEntry?.role ?? "viewer";
           const canCreateApproved = isBootstrapAdmin || (activeAdmins !== 0 && isAllowlisted);
           const isInitialBootstrap = activeAdmins === 0 && !env.GOOGLE_BOOTSTRAP_SUB;
 
@@ -392,7 +393,7 @@ export default {
             WORKSHOP_ID,
             payload.name?.trim() || payload.email,
             payload.email,
-            canCreateApproved && isBootstrapAdmin ? "admin" : "viewer",
+            isBootstrapAdmin ? "admin" : (isAllowlisted ? allowlistRole : "viewer"),
             canCreateApproved ? "APPROVED" : "PENDING",
             timestamp
           ).run();
@@ -414,8 +415,8 @@ export default {
           ).bind(uuid(), user.id, payload.sub, payload.email, payload.email_verified ? 1 : 0, now()).run();
 
           const allowlistEntry = await env.DB.prepare(
-            "SELECT id FROM google_access_allowlist WHERE workshop_id=?1 AND status='ACTIVE' AND (google_sub=?2 OR email=?3)"
-          ).bind(WORKSHOP_ID, payload.sub, payload.email).first("id");
+            "SELECT id, role FROM google_access_allowlist WHERE workshop_id=?1 AND status='ACTIVE' AND (google_sub=?2 OR email=?3)"
+          ).bind(WORKSHOP_ID, payload.sub, payload.email).first<{ id: string; role: string | null }>();
           const activeAdmins = await env.DB.prepare(
             "SELECT COUNT(*) AS count FROM users WHERE role='admin' AND status='APPROVED' AND deactivated_at IS NULL"
           ).bind().first<number>("count");
@@ -432,10 +433,12 @@ export default {
             return json({ error: "Cuenta no autorizada" }, 403);
           }
           if (allowlistEntry && user.status === "PENDING") {
+            const newRole = allowlistEntry.role ?? user.role;
             await env.DB.prepare(
-              "UPDATE users SET status='APPROVED',deactivated_at=NULL WHERE id=?1"
-            ).bind(user.id).run();
+              "UPDATE users SET status='APPROVED',role=?1,deactivated_at=NULL WHERE id=?2"
+            ).bind(newRole, user.id).run();
             user.status = "APPROVED";
+            user.role = newRole;
             user.deactivated_at = null;
           }
           if (allowlistEntry) {
@@ -580,7 +583,7 @@ export default {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
         const accounts = await env.DB.prepare(
-          "SELECT id,email,google_sub,status,created_at,updated_at FROM google_access_allowlist WHERE workshop_id=?1 ORDER BY created_at DESC"
+          "SELECT id,email,google_sub,status,role,created_at,updated_at FROM google_access_allowlist WHERE workshop_id=?1 ORDER BY created_at DESC"
         ).bind(WORKSHOP_ID).all();
         return json({ accounts: accounts.results });
       }
@@ -591,14 +594,17 @@ export default {
         const body = await readJson(request);
         const email = text(body.email, "Email").toLowerCase();
         const googleSub = body.googleSub ? text(body.googleSub, "Google sub") : null;
+        const allowedRoles = ["admin", "reception", "technician", "technical_lead", "cashier", "viewer"];
+        const role = allowedRoles.includes(String(body.role ?? "viewer")) ? String(body.role) : "viewer";
         const id = uuid();
         await env.DB.prepare(`
-          INSERT INTO google_access_allowlist (id,workshop_id,google_sub,email,status,created_by,created_at,updated_at)
-          VALUES (?1,?2,?3,?4,'ACTIVE',?5,?6,?7)
+          INSERT INTO google_access_allowlist (id,workshop_id,google_sub,email,status,role,created_by,created_at,updated_at)
+          VALUES (?1,?2,?3,?4,'ACTIVE',?5,?6,?7,?8)
           ON CONFLICT(workshop_id,email) DO UPDATE SET
             google_sub=COALESCE(excluded.google_sub,google_access_allowlist.google_sub),
+            role=excluded.role,
             status='ACTIVE',updated_at=excluded.updated_at
-        `).bind(id, WORKSHOP_ID, googleSub, email, authenticatedSession.id, now(), now()).run();
+        `).bind(id, WORKSHOP_ID, googleSub, email, role, authenticatedSession.id, now(), now()).run();
         await audit(env.DB, "google_account.allowlisted", "google_account", id, { email, googleSub: Boolean(googleSub) });
         return json({ ok: true }, 201);
       }

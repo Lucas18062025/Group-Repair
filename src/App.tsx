@@ -53,6 +53,7 @@ interface GoogleAllowlistAccount {
   email: string;
   google_sub: string | null;
   status: string;
+  role?: string;
   created_at: string;
   updated_at: string;
 }
@@ -687,7 +688,8 @@ export default function App() {
         method: "POST",
         body: JSON.stringify({
           email: data.get("email"),
-          googleSub: data.get("googleSub") || null
+          googleSub: data.get("googleSub") || null,
+          role: data.get("role") || "viewer"
         })
       });
       form.reset();
@@ -2186,17 +2188,28 @@ export default function App() {
                   <form className="form allowlist-form" onSubmit={addGoogleAccount}>
                     <label>Email autorizado<input name="email" type="email" required /></label>
                     <label>Google <code>sub</code> (opcional)<input name="googleSub" /></label>
+<label>Rol por defecto
+                       <select name="role" defaultValue="cashier">
+                         <option value="admin">Administrador</option>
+                         <option value="reception">Recepción</option>
+                         <option value="technician">Técnico</option>
+                         <option value="technical_lead">Responsable técnico</option>
+                         <option value="cashier">Caja</option>
+                         <option value="viewer">Consulta</option>
+                       </select>
+                     </label>
                     <button className="primary" type="submit">Autorizar cuenta</button>
                   </form>
                   <div className="table-wrap">
                     <table>
-                      <thead><tr><th>Email</th><th>Google sub</th><th>Estado</th><th>Acción</th></tr></thead>
+                      <thead><tr><th>Email</th><th>Google sub</th><th>Rol</th><th>Estado</th><th>Acción</th></tr></thead>
                       <tbody>
                         {googleAccounts.map((account) => (
                           <tr key={account.id}>
                             <td>{account.email}</td>
                             <td>{account.google_sub ?? "Pendiente"}</td>
-                            <td>{account.status}</td>
+                            <td>{account.role ?? "viewer"}</td>
+                             <td>{account.status}</td>
                             <td><button className="secondary" type="button" onClick={() => removeGoogleAccount(account.id)}>Retirar</button></td>
                           </tr>
                         ))}
