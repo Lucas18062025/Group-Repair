@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { formatDateTimeDisplay, formatDateTimeLocal } from "./domain/dates";
+import { ORDER_STATUSES } from "./domain/status";
 
 type Tab = "panel" | "clientes" | "equipos" | "ordenes" | "inventario" | "asistencia";
 
@@ -1871,7 +1872,18 @@ export default function App() {
                 {orders
                   .filter((order) => orderFilter === "TODAS" || order.status === orderFilter || (orderFilter === "WAITING_FOR_PARTS" && ["WAITING_FOR_PARTS", "QUOTED", "APPROVED"].includes(order.status)) || (orderFilter === "READY_FOR_DELIVERY" && ["TESTING", "READY_FOR_DELIVERY", "NOT_REPAIRABLE"].includes(order.status)))
                   .filter((order) => !orderSearch || `${order.reference} ${order.customer_name} ${order.brand} ${order.model} ${order.reported_issue}`.toLowerCase().includes(orderSearch.toLowerCase()))
-                  .map(order => <tr key={order.id}><td><strong>{order.reference}</strong></td><td>{order.customer_name}<br /><small>{order.customer_phone ?? ""}</small></td><td>{order.brand} {order.model}{order.serial_number ? ` · ${order.serial_number}` : ""}</td><td>{order.received_at ? formatDateTimeDisplay(order.received_at) : formatDateTimeDisplay(order.created_at)}</td><td><span className={`badge badge-${order.status.toLowerCase()}`}>{statusLabel(order.status)}</span></td><td>{order.technician_name ?? "Sin asignar"}</td><td>{formatMoney(order.total_minor ?? 0)}</td><td>{formatDateTimeDisplay(order.created_at)}</td><td><div className="row-actions"><button className="secondary" type="button" onClick={() => openOrder(order)}>Detalle</button><button className="secondary" type="button" onClick={() => editOrder(order)}>Editar</button></div></td></tr>)}
+                  .map(order => <tr key={order.id}><td><strong>{order.reference}</strong></td><td>{order.customer_name}<br /><small>{order.customer_phone ?? ""}</small></td><td>{order.brand} {order.model}{order.serial_number ? ` · ${order.serial_number}` : ""}</td><td>{order.received_at ? formatDateTimeDisplay(order.received_at) : formatDateTimeDisplay(order.created_at)}</td><td>
+  <select
+    className={`badge badge-${order.status.toLowerCase()}`}
+    value={order.status}
+    onChange={(event) => void changeOrderStatus(order, event.target.value)}
+    aria-label={`Estado de ${order.reference}`}
+  >
+    {ORDER_STATUSES.map((status) => (
+      <option key={status} value={status}>{statusLabel(status)}</option>
+    ))}
+  </select>
+</td><td>{order.technician_name ?? "Sin asignar"}</td><td>{formatMoney(order.total_minor ?? 0)}</td><td>{formatDateTimeDisplay(order.created_at)}</td><td><div className="row-actions"><button className="secondary" type="button" onClick={() => openOrder(order)}>Detalle</button><button className="secondary" type="button" onClick={() => editOrder(order)}>Editar</button></div></td></tr>)}
               </tbody></table></div>
               {!orders.length && <p className="empty">Todavía no hay órdenes registradas. Crea la primera desde este módulo.</p>}
             </article>
