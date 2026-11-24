@@ -203,6 +203,68 @@ function statusLabel(status: string): string {
   return labels[status] ?? status;
 }
 
+function renderNavIcon(tabKey: Tab) {
+  switch (tabKey) {
+    case "panel":
+      return (
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="3" y="3" width="7" height="7"></rect>
+          <rect x="14" y="3" width="7" height="7"></rect>
+          <rect x="14" y="14" width="7" height="7"></rect>
+          <rect x="3" y="14" width="7" height="7"></rect>
+        </svg>
+      );
+    case "clientes":
+      return (
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+          <circle cx="9" cy="7" r="4"></circle>
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+          <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+        </svg>
+      );
+    case "equipos":
+      return (
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect>
+          <rect x="9" y="9" width="6" height="6"></rect>
+          <line x1="9" y1="1" x2="9" y2="4"></line>
+          <line x1="15" y1="1" x2="15" y2="4"></line>
+          <line x1="9" y1="20" x2="9" y2="23"></line>
+          <line x1="15" y1="20" x2="15" y2="23"></line>
+          <line x1="20" y1="9" x2="23" y2="9"></line>
+          <line x1="20" y1="14" x2="23" y2="14"></line>
+          <line x1="1" y1="9" x2="4" y2="9"></line>
+          <line x1="1" y1="14" x2="4" y2="14"></line>
+        </svg>
+      );
+    case "ordenes":
+      return (
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+          <polyline points="14 2 14 8 20 8"></polyline>
+          <line x1="16" y1="13" x2="8" y2="13"></line>
+          <line x1="16" y1="17" x2="8" y2="17"></line>
+          <polyline points="10 9 9 9 8 9"></polyline>
+        </svg>
+      );
+    case "inventario":
+      return (
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="21 8 21 21 3 21 3 8"></polyline>
+          <rect x="1" y="3" width="22" height="5"></rect>
+          <line x1="10" y1="12" x2="14" y2="12"></line>
+        </svg>
+      );
+    case "asistencia":
+      return (
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+        </svg>
+      );
+  }
+}
+
 export default function App() {
   const initialTab = new URLSearchParams(window.location.search).get("tab");
   const [tab, setTab] = useState<Tab>(
@@ -1586,7 +1648,7 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand">
           <img className="brand-mark" src="/Group-Repair.jpg" alt="Logo de Group Repair" />
-          <div className="brand-text"><strong>Group Repair</strong><small>Taller técnico</small></div>
+          <div className="brand-text"><strong>GROUP REPAIR</strong><small>Taller Especializado</small></div>
         </div>
         <nav aria-label="Navegación principal">
           {([
@@ -1597,7 +1659,10 @@ export default function App() {
             ["inventario", "Inventario"],
             ["asistencia", "Asistencia"]
           ] as Array<[Tab, string]>).map(([key, label]) => (
-            <button key={key} className={tab === key ? "active" : ""} onClick={() => navigateTab(key)}>{label}</button>
+            <button key={key} className={tab === key ? "active" : ""} onClick={() => navigateTab(key)}>
+              <span className="nav-icon" aria-hidden="true">{renderNavIcon(key)}</span>
+              <span className="nav-label">{label}</span>
+            </button>
           ))}
         </nav>
       </aside>
@@ -1793,7 +1858,7 @@ export default function App() {
                 {orders
                   .filter((order) => orderFilter === "TODAS" || order.status === orderFilter || (orderFilter === "WAITING_FOR_PARTS" && ["WAITING_FOR_PARTS", "QUOTED", "APPROVED"].includes(order.status)) || (orderFilter === "READY_FOR_DELIVERY" && ["TESTING", "READY_FOR_DELIVERY", "NOT_REPAIRABLE"].includes(order.status)))
                   .filter((order) => !orderSearch || `${order.reference} ${order.customer_name} ${order.brand} ${order.model} ${order.reported_issue}`.toLowerCase().includes(orderSearch.toLowerCase()))
-                  .map(order => <tr key={order.id}><td><strong>{order.reference}</strong></td><td>{order.customer_name}<br /><small>{order.customer_phone ?? ""}</small></td><td>{order.brand} {order.model}{order.serial_number ? ` · ${order.serial_number}` : ""}</td><td>{order.received_at ? formatDateTimeDisplay(order.received_at) : formatDateTimeDisplay(order.created_at)}</td><td><span className="badge">{statusLabel(order.status)}</span></td><td>{order.technician_name ?? "Sin asignar"}</td><td>{formatMoney(order.total_minor ?? 0)}</td><td>{formatDateTimeDisplay(order.created_at)}</td><td><div className="row-actions"><button className="secondary" type="button" onClick={() => openOrder(order)}>Detalle</button><button className="secondary" type="button" onClick={() => editOrder(order)}>Editar</button></div></td></tr>)}
+                  .map(order => <tr key={order.id}><td><strong>{order.reference}</strong></td><td>{order.customer_name}<br /><small>{order.customer_phone ?? ""}</small></td><td>{order.brand} {order.model}{order.serial_number ? ` · ${order.serial_number}` : ""}</td><td>{order.received_at ? formatDateTimeDisplay(order.received_at) : formatDateTimeDisplay(order.created_at)}</td><td><span className={`badge badge-${order.status.toLowerCase()}`}>{statusLabel(order.status)}</span></td><td>{order.technician_name ?? "Sin asignar"}</td><td>{formatMoney(order.total_minor ?? 0)}</td><td>{formatDateTimeDisplay(order.created_at)}</td><td><div className="row-actions"><button className="secondary" type="button" onClick={() => openOrder(order)}>Detalle</button><button className="secondary" type="button" onClick={() => editOrder(order)}>Editar</button></div></td></tr>)}
               </tbody></table></div>
               {!orders.length && <p className="empty">Todavía no hay órdenes registradas. Crea la primera desde este módulo.</p>}
             </article>
@@ -1845,7 +1910,7 @@ export default function App() {
                   <dt>Observaciones</dt><dd>{selectedOrder.observations ?? "Sin observaciones"}</dd>
                   <dt>Accesorios</dt><dd>{selectedOrder.accessories ?? "Sin accesorios"}</dd>
                   <dt>Técnico</dt><dd>{selectedOrder.technician_name ?? "Sin asignar"}</dd>
-                  <dt>Estado</dt><dd>{statusLabel(selectedOrder.status)}</dd>
+                  <dt>Estado</dt><dd><span className={`badge badge-${selectedOrder.status.toLowerCase()}`}>{statusLabel(selectedOrder.status)}</span></dd>
                 </dl>
                   <div className="drawer-actions">
                     <button className="secondary" type="button" onClick={() => editOrder(selectedOrder)}>Editar orden</button>
@@ -2199,7 +2264,7 @@ export default function App() {
                       <td>{request.request_type === "REPAIR" ? "Reparación" : "Contacto"}</td>
                       <td>{request.name}<br /><small>{request.phone}</small></td>
                       <td>{request.problem}</td>
-                      <td><span className="badge">{request.status}</span></td>
+                      <td><span className={`badge badge-${request.status.toLowerCase().replace(/\s+/g, '-')}`}>{request.status}</span></td>
                       <td>{new Date(request.created_at).toLocaleString("es-AR")}</td>
                       <td><div className="row-actions">
                         <select aria-label={`Estado de ${request.reference}`} value={request.status} onChange={(event) => updateAssistantRequestStatus(request.id, event.target.value)}>
