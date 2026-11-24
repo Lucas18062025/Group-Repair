@@ -407,7 +407,7 @@ export default {
           if (allowlistEntry) {
             await env.DB.prepare(
               "UPDATE google_access_allowlist SET google_sub=?1,updated_at=?2 WHERE id=?3"
-            ).bind(payload.sub, timestamp, allowlistEntry).run();
+            ).bind(payload.sub, timestamp, allowlistEntry.id).run();
           }
         } else {
           await env.DB.prepare(
@@ -444,7 +444,7 @@ export default {
           if (allowlistEntry) {
             await env.DB.prepare(
               "UPDATE google_access_allowlist SET google_sub=?1,updated_at=?2 WHERE id=?3"
-            ).bind(payload.sub, now(), allowlistEntry).run();
+            ).bind(payload.sub, now(), allowlistEntry.id).run();
           }
         }
 
