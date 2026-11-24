@@ -2317,6 +2317,7 @@ export default {
       }
 
       if (url.pathname === "/api/inventory/movements" && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         const partId = url.searchParams.get("part");
         const kind = url.searchParams.get("kind");
         const orderId = url.searchParams.get("order");
@@ -2410,6 +2411,7 @@ export default {
 
       const partDetailMatch = url.pathname.match(/^\/api\/parts\/([^/]+)$/);
       if (partDetailMatch && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         const partId = partDetailMatch[1];
         const part = await env.DB.prepare(`
           SELECT p.id,p.sku,p.name,p.category,p.location,p.cost_minor,p.sale_price_minor,p.minimum_stock,
