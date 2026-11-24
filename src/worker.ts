@@ -120,7 +120,11 @@ function json(data: unknown, status = 200): Response {
     headers: {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
-      "x-content-type-options": "nosniff"
+      "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
+      "referrer-policy": "strict-origin-when-cross-origin",
+      "strict-transport-security": "max-age=31536000; includeSubDomains",
+      "content-security-policy": "default-src 'self'; script-src 'self' 'unsafe-inline' https://accounts.google.com https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' https://generativelanguage.googleapis.com https://www.googleapis.com; frame-ancestors 'none'"
     }
   });
 }
@@ -164,8 +168,9 @@ const NORMALIZED_PHONE_SQL =
   "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone,' ',''),'-',''),'+',''),'(',''),')',''),'.','')";
 
 function clientSubject(request: Request): string {
-  const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  const ip = request.headers.get("cf-connecting-ip") ?? forwarded ?? "local";
+  // Solo confiar en cf-connecting-ip (Cloudflare edge). No usar x-forwarded-for
+  // para evitar spoofing fuera del edge.
+  const ip = request.headers.get("cf-connecting-ip") ?? "local";
   return `ip:${ip}`;
 }
 
@@ -285,6 +290,26 @@ export default {
     try {
       await ensureWorkshop(env.DB);
       const url = new URL(request.url);
+
+      // CSRF: validar Origin/Referer en mutaciones
+      if (!["GET", "HEAD", "OPTIONS"].includes(request.method)) {
+        const origin = request.headers.get("origin");
+        const referer = request.headers.get("referer");
+        const allowedOrigin = url.origin;
+        if (origin && origin !== allowedOrigin) {
+          return json({ error: "Origen no permitido" }, 403);
+        }
+        if (!origin && referer) {
+          try {
+            const refOrigin = new URL(referer).origin;
+            if (refOrigin !== allowedOrigin) {
+              return json({ error: "Origen no permitido" }, 403);
+            }
+          } catch {
+            return json({ error: "Origen no permitido" }, 403);
+          }
+        }
+      }
 
       if (url.pathname === "/privacy" || url.pathname === "/privacy-policy") {
         return env.ASSETS.fetch(new Request(new URL("/privacy.html", url.origin).toString()));
@@ -1110,7 +1135,8 @@ export default {
 
         const headers = new Headers();
         headers.set("Content-Type", attachment.mime_type || "application/octet-stream");
-        headers.set("Content-Disposition", `inline; filename="${attachment.file_name}"`);
+        const safeFileName = encodeURIComponent(attachment.file_name).replace(/'/g, "%27");
+        headers.set("Content-Disposition", `inline; filename*=UTF-8''${safeFileName}`);
         headers.set("X-Content-Type-Options", "nosniff");
         headers.set("Cache-Control", "private, max-age=3600");
         headers.set("Content-Security-Policy", "default-src 'none'; sandbox");
@@ -1240,6 +1266,7 @@ export default {
       }
 
       if (url.pathname === "/api/dashboard" && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         const [orders, customers, devices, lowStock, payments] = await Promise.all([
           env.DB.prepare("SELECT status, COUNT(*) AS count FROM repair_orders WHERE workshop_id=?1 GROUP BY status").bind(WORKSHOP_ID).all<{ status: string; count: number }>(),
           env.DB.prepare("SELECT COUNT(*) AS count FROM customers WHERE workshop_id=?1 AND status='ACTIVO'").bind(WORKSHOP_ID).first<number>("count"),
@@ -1262,6 +1289,7 @@ export default {
       }
 
       if (url.pathname === "/api/customers" && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         const result = await env.DB.prepare(
           `SELECT c.id,c.name,c.surname,c.phone,c.email,c.address,c.observations,c.status,c.owner_user_id,c.created_at,c.updated_at,
                   COUNT(DISTINCT d.id) AS device_count,
@@ -1299,6 +1327,7 @@ export default {
 
       const customerMatch = url.pathname.match(/^\/api\/customers\/([^/]+)$/);
       if (customerMatch && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         const customerId = customerMatch[1];
         const customer = await env.DB.prepare(`
           SELECT c.*,COUNT(DISTINCT d.id) AS device_count,COUNT(DISTINCT ro.id) AS order_count
@@ -1423,6 +1452,7 @@ export default {
       }
 
       if (url.pathname === "/api/devices" && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         const customerId = url.searchParams.get("customer");
         let statement: D1PreparedStatement;
         if (customerId) {
@@ -1439,6 +1469,7 @@ export default {
       }
 
       if (url.pathname === "/api/orders" && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         const result = await env.DB.prepare(`
           SELECT ro.id,ro.reference,ro.reported_issue,ro.priority,ro.status,ro.created_at,
                  ro.received_at,ro.observations,ro.accessories,ro.assigned_user_id,
@@ -1504,6 +1535,7 @@ export default {
 
       const orderDetailMatch = url.pathname.match(/^\/api\/orders\/([^/]+)$/);
       if (orderDetailMatch && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         const orderId = orderDetailMatch[1];
         const order = await env.DB.prepare(`
           SELECT ro.*,c.name AS customer_name,c.phone AS customer_phone,c.email AS customer_email,
@@ -2168,6 +2200,7 @@ export default {
       }
 
       if (url.pathname === "/api/parts" && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         const result = await env.DB.prepare(`
           SELECT p.id,p.sku,p.name,p.category,p.location,p.cost_minor,p.sale_price_minor,p.minimum_stock,
                  p.status,p.archived_at,p.created_at,p.updated_at,

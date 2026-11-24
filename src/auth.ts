@@ -10,6 +10,9 @@ export interface AuthDatabase {
   batch(statements: AuthPreparedStatement[]): Promise<unknown[]>;
 }
 
+interface JwksCache { keys: GoogleJwk[]; fetchedAt: number; }
+let jwksCache: JwksCache | null = null;
+
 export interface GooglePayload {
   sub: string;
   email?: string;
@@ -75,12 +78,17 @@ export async function verifyGoogleIdToken(
   if (!payload.sub) throw new Error("Identidad de Google sin sub");
   if (!payload.nonce || payload.nonce !== nonce) throw new Error("Nonce de ID Token inválido");
 
-  const jwksResponse = await fetch("https://www.googleapis.com/oauth2/v3/certs", {
-    headers: { "cache-control": "public, max-age=300" }
-  });
-  if (!jwksResponse.ok) throw new Error("No se pudieron obtener claves de Google");
-  const jwks = await jwksResponse.json() as { keys: GoogleJwk[] };
-  const jwk = jwks.keys.find((key) => key.kid === header.kid);
+  // Caché de JWKS con TTL de 5 minutos para reducir latencia y dependencia de red.
+  const nowMs = Date.now();
+  if (!jwksCache || nowMs - jwksCache.fetchedAt > 5 * 60 * 1000) {
+    const jwksResponse = await fetch("https://www.googleapis.com/oauth2/v3/certs", {
+      headers: { "cache-control": "public, max-age=300" }
+    });
+    if (!jwksResponse.ok) throw new Error("No se pudieron obtener claves de Google");
+    const jwks = await jwksResponse.json() as { keys: GoogleJwk[] };
+    jwksCache = { keys: jwks.keys, fetchedAt: nowMs };
+  }
+  const jwk = jwksCache.keys.find((key) => key.kid === header.kid);
   if (!jwk) throw new Error("Clave de Google no disponible");
 
   const key = await crypto.subtle.importKey(

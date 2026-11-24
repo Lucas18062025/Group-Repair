@@ -15,11 +15,11 @@ Group Repair es una aplicación web para gestionar las operaciones de un taller 
 
 La aplicación incluye un panel operativo y secciones para clientes, equipos, órdenes e inventario. El Worker expone operaciones de API para la gestión del taller, con validaciones de dominio, registro de eventos y persistencia en D1. La disponibilidad de servicios externos —por ejemplo, Google o Gemini— depende de la configuración de credenciales y APIs correspondientes.
 
-## Acceso público temporal
+## Acceso y autenticación
 
-El acceso al panel y a las operaciones generales de negocio está habilitado sin login obligatorio. Las funciones administrativas, la gestión de cuentas Google autorizadas y las credenciales OAuth permanecen protegidas por sesión aprobada.
+Las operaciones de negocio (clientes, equipos, órdenes, inventario, dashboard) requieren una sesión aprobada. Las funciones administrativas, la gestión de cuentas Google autorizadas y las credenciales OAuth permanecen protegidas por sesión aprobada. El asistente virtual público (consultas y solicitudes) sigue disponible sin login.
 
-Mientras el modo público esté activo, terceros pueden utilizar las operaciones generales disponibles desde la aplicación. No se debe usar con datos reales de clientes hasta que se habilite la separación multiusuario y se revisen los permisos del taller. Los secretos de Google, Gemini y Cloudflare no se exponen al frontend.
+Los secretos de Google, Gemini y Cloudflare no se exponen al frontend. Configure `GOOGLE_BOOTSTRAP_SUB` antes del primer despliegue para definir el administrador inicial.
 
 ## Órdenes e inventario
 
