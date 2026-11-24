@@ -340,6 +340,7 @@ export default function App() {
   const [knowledgeCategory, setKnowledgeCategory] = useState("Horarios");
   const [knowledgeQuestion, setKnowledgeQuestion] = useState("");
   const [knowledgeAnswer, setKnowledgeAnswer] = useState("");
+  const [knowledgeEntries, setKnowledgeEntries] = useState<Array<{ id: string; category: string; question: string; answer: string; active: number }>>([]);
 
   function navigateTab(nextTab: Tab) {
     setTab(nextTab);
@@ -536,6 +537,9 @@ export default function App() {
       void api<{ requests: AssistantRequest[] }>("/api/admin/assistant/requests")
         .then((result) => setAssistantRequests(result.requests))
         .catch((error) => setMessage(error instanceof Error ? error.message : "No se pudieron cargar las solicitudes"));
+      void api<{ knowledge: Array<{ id: string; category: string; question: string; answer: string; active: number }> }>("/api/assistant/knowledge")
+        .then((result) => setKnowledgeEntries(result.knowledge as Array<{ id: string; category: string; question: string; answer: string; active: number }>))
+        .catch(() => setKnowledgeEntries([]));
     }
   }, [tab, authUser]);
 
@@ -642,8 +646,22 @@ export default function App() {
       setKnowledgeQuestion("");
       setKnowledgeAnswer("");
       setMessage("Conocimiento agregado");
+      void api<{ knowledge: Array<{ id: string; category: string; question: string; answer: string; active: number }> }>("/api/assistant/knowledge")
+        .then((result) => setKnowledgeEntries(result.knowledge as Array<{ id: string; category: string; question: string; answer: string; active: number }>))
+        .catch(() => {});
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "No se pudo guardar el conocimiento");
+    }
+  }
+
+  async function deleteKnowledge(id: string) {
+    if (!window.confirm("¿Eliminar esta entrada de conocimiento?")) return;
+    try {
+      await api(`/api/admin/assistant/knowledge/${id}`, { method: "DELETE" });
+      setKnowledgeEntries((entries) => entries.filter((e) => e.id !== id));
+      setMessage("Entrada eliminada");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo eliminar la entrada");
     }
   }
 
@@ -2495,8 +2513,26 @@ export default function App() {
                   <label>Pregunta<input value={knowledgeQuestion} onChange={(event) => setKnowledgeQuestion(event.target.value)} maxLength={500} required /></label>
                   <label>Respuesta<textarea value={knowledgeAnswer} onChange={(event) => setKnowledgeAnswer(event.target.value)} maxLength={2000} required /></label>
                   <button className="primary" type="submit" disabled={busy}>Agregar conocimiento</button>
-                </form>
-              </article>
+                 </form>
+                 <div className="table-wrap" style={{ marginTop: "16px" }}>
+                   <table>
+                     <thead><tr><th>Categoría</th><th>Pregunta</th><th>Respuesta</th><th>Acciones</th></tr></thead>
+                     <tbody>
+                       {knowledgeEntries.map((entry) => (
+                         <tr key={entry.id}>
+                           <td>{entry.category}</td>
+                           <td>{entry.question}</td>
+                           <td>{entry.answer}</td>
+                           <td><div className="row-actions">
+                             <button className="danger" type="button" onClick={() => deleteKnowledge(entry.id)}>Eliminar</button>
+                           </div></td>
+                         </tr>
+                       ))}
+                     </tbody>
+                   </table>
+                   {!knowledgeEntries.length && <p className="empty">No hay entradas de conocimiento.</p>}
+                 </div>
+               </article>
               </>
             )}
           </section>

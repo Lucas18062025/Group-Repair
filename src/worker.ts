@@ -2057,6 +2057,44 @@ export default {
         return json({ id }, 201);
       }
 
+      const knowledgeMatch = url.pathname.match(/^\/api\/admin\/assistant\/knowledge\/([^/]+)$/);
+      if (knowledgeMatch && request.method === "PATCH") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        if (!["admin", "reception"].includes(authenticatedSession.role)) {
+          return json({ error: "Permisos insuficientes" }, 403);
+        }
+        const knowledgeId = knowledgeMatch[1];
+        const body = await readJson(request);
+        const category = body.category ? text(body.category, "Categoría").slice(0, 120) : null;
+        const question = body.question ? text(body.question, "Pregunta").slice(0, 500) : null;
+        const answer = body.answer ? text(body.answer, "Respuesta").slice(0, 2000) : null;
+        const active = body.active === undefined ? null : (body.active ? 1 : 0);
+        await env.DB.prepare(`
+          UPDATE knowledge_base SET
+            category=COALESCE(?1,category),
+            question=COALESCE(?2,question),
+            answer=COALESCE(?3,answer),
+            active=COALESCE(?4,active),
+            updated_at=?5
+          WHERE id=?6 AND workshop_id=?7
+        `).bind(category, question, answer, active, now(), knowledgeId, WORKSHOP_ID).run();
+        await audit(env.DB, "knowledge.updated", "knowledge_base", knowledgeId, { category: body.category }, authenticatedSession.id);
+        return json({ ok: true });
+      }
+
+      if (knowledgeMatch && request.method === "DELETE") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        if (!["admin", "reception"].includes(authenticatedSession.role)) {
+          return json({ error: "Permisos insuficientes" }, 403);
+        }
+        const knowledgeId = knowledgeMatch[1];
+        await env.DB.prepare(
+          "DELETE FROM knowledge_base WHERE id=?1 AND workshop_id=?2"
+        ).bind(knowledgeId, WORKSHOP_ID).run();
+        await audit(env.DB, "knowledge.deleted", "knowledge_base", knowledgeId, null, authenticatedSession.id);
+        return json({ ok: true });
+      }
+
       if (url.pathname === "/api/admin/assistant/requests" && request.method === "GET") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         if (!["admin", "reception", "technical_lead"].includes(authenticatedSession.role)) {
