@@ -341,6 +341,8 @@ export default function App() {
   const [knowledgeQuestion, setKnowledgeQuestion] = useState("");
   const [knowledgeAnswer, setKnowledgeAnswer] = useState("");
   const [knowledgeEntries, setKnowledgeEntries] = useState<Array<{ id: string; category: string; question: string; answer: string; active: number }>>([]);
+  const [editingKnowledgeId, setEditingKnowledgeId] = useState<string | null>(null);
+  const [knowledgeEditDraft, setKnowledgeEditDraft] = useState<Record<string, string>>({});
 
   function navigateTab(nextTab: Tab) {
     setTab(nextTab);
@@ -658,10 +660,35 @@ export default function App() {
     if (!window.confirm("¿Eliminar esta entrada de conocimiento?")) return;
     try {
       await api(`/api/admin/assistant/knowledge/${id}`, { method: "DELETE" });
-      setKnowledgeEntries((entries) => entries.filter((e) => e.id !== id));
+      const result = await api<{ knowledge: Array<{ id: string; category: string; question: string; answer: string; active: number }> }>("/api/assistant/knowledge");
+      setKnowledgeEntries(result.knowledge as Array<{ id: string; category: string; question: string; answer: string; active: number }>);
       setMessage("Entrada eliminada");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "No se pudo eliminar la entrada");
+    }
+  }
+
+  async function editKnowledgeInline(entry: { id: string; category: string; question: string; answer: string; active: number }) {
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada");
+      return;
+    }
+    const category = (knowledgeEditDraft.category ?? entry.category).trim();
+    const question = (knowledgeEditDraft.question ?? entry.question).trim();
+    const answer = (knowledgeEditDraft.answer ?? entry.answer).trim();
+    if (!category || !question || !answer) return;
+    try {
+      await api(`/api/admin/assistant/knowledge/${entry.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ category, question, answer })
+      });
+      const result = await api<{ knowledge: Array<{ id: string; category: string; question: string; answer: string; active: number }> }>("/api/assistant/knowledge");
+      setKnowledgeEntries(result.knowledge as Array<{ id: string; category: string; question: string; answer: string; active: number }>);
+      setEditingKnowledgeId(null);
+      setMessage("Entrada actualizada");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo actualizar la entrada");
     }
   }
 
@@ -2519,14 +2546,32 @@ export default function App() {
                      <thead><tr><th>Categoría</th><th>Pregunta</th><th>Respuesta</th><th>Acciones</th></tr></thead>
                      <tbody>
                        {knowledgeEntries.map((entry) => (
-                         <tr key={entry.id}>
-                           <td>{entry.category}</td>
-                           <td>{entry.question}</td>
-                           <td>{entry.answer}</td>
-                           <td><div className="row-actions">
-                             <button className="danger" type="button" onClick={() => deleteKnowledge(entry.id)}>Eliminar</button>
-                           </div></td>
-                         </tr>
+                         <Fragment key={entry.id}>
+                           <tr>
+                             <td>{entry.category}</td>
+                             <td>{entry.question}</td>
+                             <td>{entry.answer}</td>
+                             <td><div className="row-actions">
+                               <button className="secondary" type="button" onClick={() => { setEditingKnowledgeId(entry.id); setKnowledgeEditDraft({ category: entry.category, question: entry.question, answer: entry.answer }); }}>Editar</button>
+                               <button className="danger" type="button" onClick={() => deleteKnowledge(entry.id)}>Eliminar</button>
+                             </div></td>
+                           </tr>
+                           {editingKnowledgeId === entry.id && (
+                             <tr className="inline-edit-row">
+                               <td colSpan={4}>
+                                 <form className="form form-grid" onSubmit={async (event) => { event.preventDefault(); await editKnowledgeInline(entry); setEditingKnowledgeId(null); }}>
+                                   <label>Categoría<input value={knowledgeEditDraft.category ?? ""} onChange={(e) => setKnowledgeEditDraft((d) => ({ ...d, category: e.target.value }))} required /></label>
+                                   <label>Pregunta<input value={knowledgeEditDraft.question ?? ""} onChange={(e) => setKnowledgeEditDraft((d) => ({ ...d, question: e.target.value }))} required /></label>
+                                   <label>Respuesta<textarea value={knowledgeEditDraft.answer ?? ""} onChange={(e) => setKnowledgeEditDraft((d) => ({ ...d, answer: e.target.value }))} required rows={3} /></label>
+                                   <div className="row-actions">
+                                     <button className="primary" type="submit" disabled={busy}>Guardar</button>
+                                     <button className="secondary" type="button" onClick={() => setEditingKnowledgeId(null)}>Cancelar</button>
+                                   </div>
+                                 </form>
+                               </td>
+                             </tr>
+                           )}
+                         </Fragment>
                        ))}
                      </tbody>
                    </table>
