@@ -294,6 +294,8 @@ export default function App() {
   const [selectedOrder, setSelectedOrder] = useState<Order | null>(null);
   const [editingOrderId, setEditingOrderId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<Record<string, string>>({});
+  const [editingCustomerId, setEditingCustomerId] = useState<string | null>(null);
+  const [customerEditDraft, setCustomerEditDraft] = useState<Record<string, string>>({});
   const [inventorySearch, setInventorySearch] = useState("");
   const [inventoryCategory, setInventoryCategory] = useState("TODAS");
   const [inventoryLocation, setInventoryLocation] = useState("TODAS");
@@ -1113,6 +1115,37 @@ export default function App() {
     }
   }
 
+  async function editCustomerInline(customer: Customer) {
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para editar clientes");
+      return;
+    }
+    const name = (customerEditDraft.name ?? customer.name).trim();
+    if (!name) return;
+    const phone = (customerEditDraft.phone ?? customer.phone).trim();
+    if (!phone) return;
+    try {
+      await api(`/api/customers/${customer.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          name,
+          surname: (customerEditDraft.surname ?? "").trim() || null,
+          phone,
+          email: (customerEditDraft.email ?? "").trim() || null,
+          address: (customerEditDraft.address ?? "").trim() || null,
+          observations: (customerEditDraft.observations ?? "").trim() || null,
+          status: customer.status ?? "ACTIVO"
+        })
+      });
+      setMessage("Cliente actualizado");
+      await refresh();
+      setEditingCustomerId(null);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo editar el cliente");
+    }
+  }
+
   async function deleteCustomer(customer: Customer) {
     if (!authUser?.status || authUser.status !== "APPROVED") {
       setShowLoginOverlay(true);
@@ -1304,6 +1337,17 @@ export default function App() {
           reportedFault: reportedIssue
         })
       });
+      const totalMinor = Number(editDraft.totalMinor ?? 0);
+      if (Number.isSafeInteger(totalMinor) && totalMinor > 0) {
+        await api(`/api/orders/${order.id}/quotes`, {
+          method: "POST",
+          body: JSON.stringify({
+            lines: [{ description: "Presupuesto", quantity: 1, unitPriceMinor: totalMinor }],
+            taxMinor: 0,
+            status: "draft"
+          })
+        });
+      }
       setMessage("Orden actualizada");
       await refresh();
       setSelectedOrder(null);
@@ -1780,14 +1824,34 @@ export default function App() {
                 {customers
                   .filter((customer) => !customerSearch || `${customer.name} ${customer.surname ?? ""} ${customer.phone} ${customer.email ?? ""}`.toLowerCase().includes(customerSearch.toLowerCase()))
                   .map(customer => (
-                    <tr key={customer.id}>
+                    <Fragment key={customer.id}>
+                      <tr key={customer.id}>
                       <td><button className="product-link" type="button" onClick={() => openCustomer(customer)}><strong>{customer.name}{customer.surname ? ` ${customer.surname}` : ""}</strong><small>{customer.address ?? "Sin dirección"}</small></button></td>
                       <td>{customer.phone}</td>
                       <td>{customer.email ?? "—"}</td>
                       <td>{customer.device_count ?? 0}</td>
                       <td>{customer.order_count ?? 0}</td>
-                      <td><div className="row-actions"><button className="secondary" type="button" onClick={() => openCustomer(customer)}>Detalle</button><button className="secondary" type="button" onClick={() => editCustomer(customer)}>Editar</button><button className="danger" type="button" onClick={() => deleteCustomer(customer)}>Eliminar</button></div></td>
+                      <td><div className="row-actions"><button className="secondary" type="button" onClick={() => openCustomer(customer)}>Detalle</button><button className="secondary" type="button" onClick={() => { setEditingCustomerId(customer.id); setCustomerEditDraft({ name: customer.name, surname: customer.surname ?? "", phone: customer.phone, email: customer.email ?? "", address: customer.address ?? "", observations: customer.observations ?? "" }); }}>Editar</button><button className="danger" type="button" onClick={() => deleteCustomer(customer)}>Eliminar</button></div></td>
                     </tr>
+                    {editingCustomerId === customer.id && (
+                      <tr className="inline-edit-row">
+                        <td colSpan={6}>
+                          <form className="form form-grid" onSubmit={async (event) => { event.preventDefault(); await editCustomerInline(customer); setEditingCustomerId(null); }}>
+                            <label>Nombre<input value={customerEditDraft.name ?? ""} onChange={(e) => setCustomerEditDraft((d) => ({ ...d, name: e.target.value }))} required /></label>
+                            <label>Apellido<input value={customerEditDraft.surname ?? ""} onChange={(e) => setCustomerEditDraft((d) => ({ ...d, surname: e.target.value }))} /></label>
+                            <label>Teléfono<input value={customerEditDraft.phone ?? ""} onChange={(e) => setCustomerEditDraft((d) => ({ ...d, phone: e.target.value }))} required /></label>
+                            <label>Email<input type="email" value={customerEditDraft.email ?? ""} onChange={(e) => setCustomerEditDraft((d) => ({ ...d, email: e.target.value }))} /></label>
+                            <label>Dirección<input value={customerEditDraft.address ?? ""} onChange={(e) => setCustomerEditDraft((d) => ({ ...d, address: e.target.value }))} /></label>
+                            <label>Observaciones<textarea value={customerEditDraft.observations ?? ""} onChange={(e) => setCustomerEditDraft((d) => ({ ...d, observations: e.target.value }))} rows={2} /></label>
+                            <div className="row-actions">
+                              <button className="primary" type="submit" disabled={busy}>Guardar</button>
+                              <button className="secondary" type="button" onClick={() => setEditingCustomerId(null)}>Cancelar</button>
+                            </div>
+                          </form>
+                        </td>
+                      </tr>
+                    )}
+                    </Fragment>
                   ))}
               </tbody></table></div>
               {!customers.filter((customer) => !customerSearch || `${customer.name} ${customer.surname ?? ""} ${customer.phone} ${customer.email ?? ""}`.toLowerCase().includes(customerSearch.toLowerCase())).length && <p className="empty">No hay clientes que coincidan.</p>}
@@ -1894,7 +1958,7 @@ export default function App() {
       <option key={status} value={status}>{statusLabel(status)}</option>
     ))}
   </select>
-</td><td>{order.technician_name ?? "Sin asignar"}</td><td>{formatMoney(order.total_minor ?? 0)}</td><td>{formatDateTimeDisplay(order.created_at)}</td><td><div className="row-actions"><button className="secondary" type="button" onClick={() => openOrder(order)}>Detalle</button><button className="secondary" type="button" onClick={() => { setEditingOrderId(order.id); setEditDraft({ reportedIssue: order.reported_issue, observations: order.observations ?? "", accessories: order.accessories ?? "", priority: order.priority }); }}>Editar</button></div></td></tr>
+</td><td>{order.technician_name ?? "Sin asignar"}</td><td>{formatMoney(order.total_minor ?? 0)}</td><td>{formatDateTimeDisplay(order.created_at)}</td><td><div className="row-actions"><button className="secondary" type="button" onClick={() => openOrder(order)}>Detalle</button><button className="secondary" type="button" onClick={() => { setEditingOrderId(order.id); setEditDraft({ reportedIssue: order.reported_issue, observations: order.observations ?? "", accessories: order.accessories ?? "", priority: order.priority, totalMinor: String(order.total_minor ?? 0) }); }}>Editar</button></div></td></tr>
                        {editingOrderId === order.id && (
                          <tr className="inline-edit-row">
                            <td colSpan={9}>
@@ -1903,6 +1967,7 @@ export default function App() {
                                <label>Prioridad<select value={editDraft.priority ?? "normal"} onChange={(e) => setEditDraft((d) => ({ ...d, priority: e.target.value }))}><option value="normal">Normal</option><option value="alta">Alta</option><option value="urgente">Urgente</option></select></label>
                                <label>Observaciones<textarea value={editDraft.observations ?? ""} onChange={(e) => setEditDraft((d) => ({ ...d, observations: e.target.value }))} rows={2} /></label>
                                <label>Accesorios<input value={editDraft.accessories ?? ""} onChange={(e) => setEditDraft((d) => ({ ...d, accessories: e.target.value }))} /></label>
+                               <label>Monto total (ARS)<input type="number" min="0" step="0.01" value={editDraft.totalMinor ? String(Number(editDraft.totalMinor) / 100) : ""} onChange={(e) => setEditDraft((d) => ({ ...d, totalMinor: String(Math.round(Number(e.target.value) * 100)) }))} /></label>
                                <div className="row-actions">
                                  <button className="primary" type="submit" disabled={busy}>Guardar</button>
                                  <button className="secondary" type="button" onClick={() => setEditingOrderId(null)}>Cancelar</button>
