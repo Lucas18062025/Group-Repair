@@ -296,6 +296,8 @@ export default function App() {
   const [editDraft, setEditDraft] = useState<Record<string, string>>({});
   const [editingCustomerId, setEditingCustomerId] = useState<string | null>(null);
   const [customerEditDraft, setCustomerEditDraft] = useState<Record<string, string>>({});
+  const [editingPartId, setEditingPartId] = useState<string | null>(null);
+  const [partEditDraft, setPartEditDraft] = useState<Record<string, string>>({});
   const [inventorySearch, setInventorySearch] = useState("");
   const [inventoryCategory, setInventoryCategory] = useState("TODAS");
   const [inventoryLocation, setInventoryLocation] = useState("TODAS");
@@ -1478,6 +1480,60 @@ export default function App() {
     }
   }
 
+  async function editPartInline(part: Part) {
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para editar productos");
+      return;
+    }
+    const sku = (partEditDraft.sku ?? part.sku).trim().toUpperCase();
+    const name = (partEditDraft.name ?? part.name).trim();
+    if (!sku || !name) return;
+    const costMinor = Math.round(Number(partEditDraft.cost ?? part.cost_minor / 100) * 100);
+    const salePriceMinor = Math.round(Number(partEditDraft.price ?? part.sale_price_minor / 100) * 100);
+    const minimumStock = Number(partEditDraft.minimum ?? part.minimum_stock);
+    if (![costMinor, salePriceMinor, minimumStock].every(Number.isSafeInteger) || costMinor < 0 || salePriceMinor < 0 || minimumStock < 0) {
+      setMessage("Los valores deben ser válidos");
+      return;
+    }
+    try {
+      await api(`/api/parts/${part.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          sku,
+          name,
+          category: (partEditDraft.category ?? part.category ?? "").trim() || null,
+          location: (partEditDraft.location ?? part.location ?? "").trim() || null,
+          costMinor,
+          salePriceMinor,
+          minimumStock
+        })
+      });
+      setMessage("Producto actualizado");
+      await refresh();
+      setEditingPartId(null);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo editar el producto");
+    }
+  }
+
+  async function deletePart(part: Part) {
+    if (!authUser?.status || authUser.status !== "APPROVED") {
+      setShowLoginOverlay(true);
+      setMessage("Se requiere una sesión aprobada para eliminar productos");
+      return;
+    }
+    if (!window.confirm(`¿Eliminar el repuesto "${part.name}"? Esta acción no se puede deshacer.`)) return;
+    try {
+      await api(`/api/parts/${part.id}`, { method: "DELETE" });
+      setMessage("Producto eliminado");
+      await refresh();
+      setSelectedPart(null);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo eliminar el producto");
+    }
+  }
+
   async function changePartStatus(part: Part, status: "ACTIVO" | "INACTIVO" | "ARCHIVADO") {
     if (!authUser?.status || authUser.status !== "APPROVED") {
       setShowLoginOverlay(true);
@@ -2118,7 +2174,8 @@ export default function App() {
                     {inventoryVisibleParts.map((part) => {
                       const availability = part.stock === 0 ? "SIN STOCK" : part.stock <= part.minimum_stock ? "STOCK BAJO" : "DISPONIBLE";
                       return (
-                        <tr key={part.id}>
+                        <Fragment key={part.id}>
+                           <tr key={part.id}>
                           <td><button className="product-link" type="button" onClick={() => openPartDetail(part)}><strong>{part.name}</strong><small>{part.sku}</small></button></td>
                           <td>{part.category ?? "Sin categoría"}</td>
                           <td>{part.location ?? "Sin ubicación"}</td>
@@ -2133,8 +2190,28 @@ export default function App() {
                           <td><span className={`stock-status ${availability === "SIN STOCK" ? "out" : availability === "STOCK BAJO" ? "low" : "available"}`}>{availability}</span></td>
                           <td>{formatMoney(part.cost_minor)}</td>
                           <td>{formatMoney(part.sale_price_minor)}</td>
-                          <td><div className="row-actions"><button className="secondary" type="button" onClick={() => adjustToFinal(part)} disabled={part.status !== "ACTIVO"}>Ajustar</button><button className="secondary" type="button" onClick={() => openPartDetail(part)}>Detalle</button></div></td>
-                        </tr>
+                          <td><div className="row-actions"><button className="secondary" type="button" onClick={() => adjustToFinal(part)} disabled={part.status !== "ACTIVO"}>Ajustar</button><button className="secondary" type="button" onClick={() => openPartDetail(part)}>Detalle</button><button className="secondary" type="button" onClick={() => { setEditingPartId(part.id); setPartEditDraft({ sku: part.sku, name: part.name, category: part.category ?? "", location: part.location ?? "", cost: String(part.cost_minor / 100), price: String(part.sale_price_minor / 100), minimum: String(part.minimum_stock) }); }}>Editar</button><button className="danger" type="button" onClick={() => deletePart(part)}>Eliminar</button></div></td>
+                         </tr>
+                         {editingPartId === part.id && (
+                           <tr className="inline-edit-row">
+                             <td colSpan={9}>
+                               <form className="form form-grid" onSubmit={async (event) => { event.preventDefault(); await editPartInline(part); setEditingPartId(null); }}>
+                                 <label>SKU<input value={partEditDraft.sku ?? ""} onChange={(e) => setPartEditDraft((d) => ({ ...d, sku: e.target.value }))} required /></label>
+                                 <label>Nombre<input value={partEditDraft.name ?? ""} onChange={(e) => setPartEditDraft((d) => ({ ...d, name: e.target.value }))} required /></label>
+                                 <label>Categoría<input value={partEditDraft.category ?? ""} onChange={(e) => setPartEditDraft((d) => ({ ...d, category: e.target.value }))} /></label>
+                                 <label>Ubicación<input value={partEditDraft.location ?? ""} onChange={(e) => setPartEditDraft((d) => ({ ...d, location: e.target.value }))} /></label>
+                                 <label>Costo ($)<input type="number" min="0" step="0.01" value={partEditDraft.cost ?? ""} onChange={(e) => setPartEditDraft((d) => ({ ...d, cost: e.target.value }))} required /></label>
+                                 <label>Precio ($)<input type="number" min="0" step="0.01" value={partEditDraft.price ?? ""} onChange={(e) => setPartEditDraft((d) => ({ ...d, price: e.target.value }))} required /></label>
+                                 <label>Stock mínimo<input type="number" min="0" step="1" value={partEditDraft.minimum ?? ""} onChange={(e) => setPartEditDraft((d) => ({ ...d, minimum: e.target.value }))} required /></label>
+                                 <div className="row-actions">
+                                   <button className="primary" type="submit" disabled={busy}>Guardar</button>
+                                   <button className="secondary" type="button" onClick={() => setEditingPartId(null)}>Cancelar</button>
+                                 </div>
+                               </form>
+                             </td>
+                           </tr>
+                         )}
+                         </Fragment>
                       );
                     })}
                   </tbody>
