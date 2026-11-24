@@ -610,6 +610,17 @@ export default function App() {
     }
   }
 
+  async function deleteAssistantRequest(requestId: string) {
+    if (!window.confirm("¿Eliminar esta solicitud de atención? Esta acción no se puede deshacer.")) return;
+    try {
+      await api(`/api/admin/assistant/requests/${requestId}`, { method: "DELETE" });
+      setAssistantRequests((requests) => requests.filter((request) => request.id !== requestId));
+      setMessage("Solicitud eliminada");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "No se pudo eliminar la solicitud");
+    }
+  }
+
   async function addKnowledge(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     try {
@@ -2284,6 +2295,7 @@ export default function App() {
                           {["NUEVA", "EN REVISION", "ESPERANDO CLIENTE", "DERIVADA", "RESUELTA", "CERRADA"].map((status) => <option key={status} value={status}>{status}</option>)}
                         </select>
                         {request.request_type === "REPAIR" && !request.order_id && <button className="secondary" type="button" onClick={() => convertAssistantRequest(request.id)}>Convertir en orden</button>}
+                         <button className="danger" type="button" onClick={() => deleteAssistantRequest(request.id)}>Eliminar</button>
                         {(request.order_reference ?? request.order_id) && <small>Orden: {request.order_reference ?? request.order_id}</small>}
                       </div></td>
                     </tr>

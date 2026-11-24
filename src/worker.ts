@@ -2092,6 +2092,20 @@ export default {
         return json({ status });
       }
 
+      const assistantDelete = url.pathname.match(/^\/api\/admin\/assistant\/requests\/([^/]+)$/);
+      if (assistantDelete && request.method === "DELETE") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        if (!["admin", "reception", "technical_lead"].includes(authenticatedSession.role)) {
+          return json({ error: "Permisos insuficientes" }, 403);
+        }
+        const requestId = assistantDelete[1];
+        await env.DB.prepare(
+          "DELETE FROM service_requests WHERE id=?1 AND workshop_id=?2"
+        ).bind(requestId, WORKSHOP_ID).run();
+        await audit(env.DB, "service_request.deleted", "service_request", requestId, null, authenticatedSession.id);
+        return json({ ok: true });
+      }
+
       const assistantConvert = url.pathname.match(/^\/api\/admin\/assistant\/requests\/([^/]+)\/convert$/);
       if (assistantConvert && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
