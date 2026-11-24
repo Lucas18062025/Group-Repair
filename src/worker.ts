@@ -2501,11 +2501,23 @@ export default {
       if (partDetailMatch && request.method === "DELETE") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para eliminar inventario" }, 401);
         const partId = partDetailMatch[1];
-        const movements = await env.DB.prepare(
-          "SELECT COUNT(*) AS count FROM stock_movements WHERE part_id=?1 AND workshop_id=?2"
-        ).bind(partId, WORKSHOP_ID).first<number>("count");
-        if ((movements ?? 0) > 0) {
-          return json({ error: "No se puede eliminar: el repuesto tiene movimientos de stock registrados." }, 409);
+        const part = await env.DB.prepare(
+          "SELECT id, status FROM parts WHERE id=?1 AND workshop_id=?2"
+        ).bind(partId, WORKSHOP_ID).first<{ id: string; status: string }>();
+        if (!part) return json({ error: "Repuesto no encontrado" }, 404);
+        // Solo se permite eliminar productos archivados; si tiene movimientos, se eliminan en cascada.
+        if (part.status !== "ARCHIVADO") {
+          const movements = await env.DB.prepare(
+            "SELECT COUNT(*) AS count FROM stock_movements WHERE part_id=?1 AND workshop_id=?2"
+          ).bind(partId, WORKSHOP_ID).first<number>("count");
+          if ((movements ?? 0) > 0) {
+            return json({ error: "No se puede eliminar: el repuesto tiene movimientos de stock registrados. Archívalo primero." }, 409);
+          }
+        } else {
+          // Producto archivado: eliminar movimientos y luego el producto.
+          await env.DB.prepare(
+            "DELETE FROM stock_movements WHERE part_id=?1 AND workshop_id=?2"
+          ).bind(partId, WORKSHOP_ID).run();
         }
         const deleted = await env.DB.prepare(
           "DELETE FROM parts WHERE id=?1 AND workshop_id=?2"
