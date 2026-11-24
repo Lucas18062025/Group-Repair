@@ -1257,7 +1257,7 @@ tr:hover td {
   position: fixed;
   z-index: 40;
   right: 28px;
-  bottom: 28px;
+  bottom: 100px;
   min-width: 120px;
   height: 56px;
   display: flex;
@@ -1304,7 +1304,7 @@ tr:hover td {
   position: fixed;
   z-index: 45;
   right: 28px;
-  bottom: 28px;
+  bottom: 100px;
   width: min(400px, calc(100vw - 32px));
   height: min(630px, calc(100vh - 48px));
   display: grid;
@@ -2265,7 +2265,7 @@ tr:hover td {
   }
   .assistant-fab {
     right: 14px;
-    bottom: 14px;
+    bottom: 90px;
     min-width: 52px;
     width: 52px;
     height: 52px;
@@ -2276,7 +2276,7 @@ tr:hover td {
   }
   .assistant-widget {
     right: 8px;
-    bottom: 8px;
+    bottom: 90px;
     width: calc(100vw - 16px);
     height: calc(100vh - 16px);
     height: calc(100dvh - 16px);
