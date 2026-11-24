@@ -660,11 +660,16 @@ export default function App() {
     if (!window.confirm("¿Eliminar esta entrada de conocimiento?")) return;
     try {
       await api(`/api/admin/assistant/knowledge/${id}`, { method: "DELETE" });
-      const result = await api<{ knowledge: Array<{ id: string; category: string; question: string; answer: string; active: number }> }>("/api/assistant/knowledge");
-      setKnowledgeEntries(result.knowledge as Array<{ id: string; category: string; question: string; answer: string; active: number }>);
       setMessage("Entrada eliminada");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "No se pudo eliminar la entrada");
+    } finally {
+      try {
+        const result = await api<{ knowledge: Array<{ id: string; category: string; question: string; answer: string; active: number }> }>("/api/assistant/knowledge");
+        setKnowledgeEntries(result.knowledge as Array<{ id: string; category: string; question: string; answer: string; active: number }>);
+      } catch {
+        // ignore
+      }
     }
   }
 
