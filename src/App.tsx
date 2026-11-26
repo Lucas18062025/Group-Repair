@@ -1847,7 +1847,7 @@ export default function App() {
               </>
             ) : (
               <>
-                <span className="session-user">Acceso público</span>
+                <span className="session-user">Sin sesión</span>
                 <button className="secondary" type="button" onClick={() => setShowLoginOverlay(true)}>Acceso administrativo</button>
               </>
             )}
@@ -1867,7 +1867,7 @@ export default function App() {
             <section className="operations-center" aria-labelledby="operations-title">
               <div className="operations-heading">
                 <div><p className="eyebrow">Accesos directos</p><h2 id="operations-title">Centro de operaciones</h2></div>
-                <span className="public-badge">Acceso público temporal</span>
+                <span className="public-badge">Sesión y rol requeridos</span>
               </div>
               <div className="operation-grid">
                 <article className="operation-card">

@@ -13,6 +13,15 @@ import {
   validateOrderStatusToolInput
 } from "./domain/customer-assistant";
 import { parseDateTimeLocalToUtcIso } from "./domain/dates";
+import {
+  AuthorizationError,
+  canAccessOrder,
+  requireAuth,
+  requireOrderAccess,
+  requireRole,
+  requireTenant,
+  isPublicApiRoute
+} from "./domain/authz";
 import { determineCustomerDeletionAction } from "./domain/customer";
 import {
   generateR2StorageKey,
@@ -277,13 +286,7 @@ function ownsOrCanAdmin(session: SessionUser | null, ownerUserId: string | null)
   return ownerUserId !== null && ownerUserId === session.id;
 }
 
-function canAccessOrder(session: SessionUser | null, order: { owner_user_id?: string | null; assigned_user_id?: string | null; created_by?: string | null }): boolean {
-  if (!session) return false;
-  if (["admin", "technical_lead"].includes(session.role)) return true;
-  return (order.assigned_user_id !== null && order.assigned_user_id !== undefined && order.assigned_user_id === session.id) ||
-         (order.owner_user_id !== null && order.owner_user_id !== undefined && order.owner_user_id === session.id) ||
-         (order.created_by !== null && order.created_by !== undefined && order.created_by === session.id);
-}
+// Order access is implemented in domain/authz.ts and always checks tenant + role + resource scope.
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -519,14 +522,17 @@ export default {
       }
 
       const session = await getSession(env.DB, request);
-      if (url.pathname.startsWith("/api/")) {
-        // Public business operations are intentionally available while authentication
-        // is disabled. Administrative and credential-bearing operations remain guarded below.
-      }
       const authenticatedSession =
         session && session.status === "APPROVED" && !session.deactivated_at
           ? session
           : null;
+
+      // Deny by default: only the explicitly listed public routes bypass authentication.
+      // Unknown APIs and unknown methods are never accidentally public.
+      if (url.pathname.startsWith("/api/") && !isPublicApiRoute(request.method, url.pathname)) {
+        requireAuth(authenticatedSession);
+        requireTenant(authenticatedSession, WORKSHOP_ID);
+      }
 
       if (url.pathname === "/api/auth/logout-all" && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
@@ -539,7 +545,7 @@ export default {
 
       if (url.pathname === "/api/admin/users" && request.method === "GET") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
-        if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
+        requireRole(authenticatedSession, "admin");
         const users = await env.DB.prepare(
           "SELECT id,workshop_id,name,email,role,status,deactivated_at,created_at,last_login_at FROM users WHERE workshop_id=?1 ORDER BY created_at DESC"
         ).bind(WORKSHOP_ID).all();
@@ -549,7 +555,7 @@ export default {
       const approvalMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/(approve|deactivate)$/);
       if (approvalMatch && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
-        if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
+        requireRole(authenticatedSession, "admin");
         const userId = approvalMatch[1];
         const action = approvalMatch[2];
         if (userId === authenticatedSession.id) return json({ error: "No puedes cambiar tu propia cuenta desde esta operación" }, 409);
@@ -565,7 +571,7 @@ export default {
       const roleMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/role$/);
       if (roleMatch && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
-        if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
+        requireRole(authenticatedSession, "admin");
         const userId = roleMatch[1];
         if (userId === authenticatedSession.id) return json({ error: "No puedes cambiar tu propio rol" }, 409);
         const body = await readJson(request);
@@ -581,7 +587,7 @@ export default {
 
       if (url.pathname === "/api/admin/google-accounts" && request.method === "GET") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
-        if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
+        requireRole(authenticatedSession, "admin");
         const accounts = await env.DB.prepare(
           "SELECT id,email,google_sub,status,role,created_at,updated_at FROM google_access_allowlist WHERE workshop_id=?1 ORDER BY created_at DESC"
         ).bind(WORKSHOP_ID).all();
@@ -590,7 +596,7 @@ export default {
 
       if (url.pathname === "/api/admin/google-accounts" && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
-        if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
+        requireRole(authenticatedSession, "admin");
         const body = await readJson(request);
         const email = text(body.email, "Email").toLowerCase();
         const googleSub = body.googleSub ? text(body.googleSub, "Google sub") : null;
@@ -612,7 +618,7 @@ export default {
       const allowlistDelete = url.pathname.match(/^\/api\/admin\/google-accounts\/([^/]+)$/);
       if (allowlistDelete && request.method === "DELETE") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
-        if (authenticatedSession.role !== "admin") return json({ error: "Permisos insuficientes" }, 403);
+        requireRole(authenticatedSession, "admin");
         const accountId = allowlistDelete[1];
         const account = await env.DB.prepare(
           "SELECT email,google_sub FROM google_access_allowlist WHERE id=?1 AND workshop_id=?2"
@@ -694,11 +700,12 @@ export default {
 
       if (url.pathname === "/api/integrations/google/connect" && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Iniciá sesión para autorizar Google Drive" }, 401);
+        requireRole(authenticatedSession, "reception", "technician", "technical_lead", "cashier");
         const body = await readJson(request) as { connectionType?: string };
         const connectionType = (body.connectionType === "WORKSHOP" ? "WORKSHOP" : "PERSONAL") as GoogleConnectionType;
 
-        if (connectionType === "WORKSHOP" && authenticatedSession.role !== "admin") {
-          return json({ error: "Solo los administradores pueden conectar el Google Drive del taller" }, 403);
+        if (connectionType === "WORKSHOP") {
+          requireRole(authenticatedSession, "admin");
         }
 
         if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
@@ -750,6 +757,7 @@ export default {
         if (!authenticatedSession) {
           return new Response(null, { status: 302, headers: { location: "/?google_error=auth_required" } });
         }
+        requireRole(authenticatedSession, "reception", "technician", "technical_lead", "cashier");
         const state = url.searchParams.get("state");
         const code = url.searchParams.get("code");
         const oauthError = url.searchParams.get("error");
@@ -828,7 +836,8 @@ export default {
           ? await encryptSecret(tokenBody.refresh_token, env.OAUTH_TOKEN_ENCRYPTION_KEY)
           : null;
         const expiresAt = new Date(Date.now() + (tokenBody.expires_in ?? 3600) * 1000).toISOString();
-        const connType = parsedState.connectionType;
+        const connType: GoogleConnectionType = record.service === "google_drive_workshop" ? "WORKSHOP" : "PERSONAL";
+        if (connType === "WORKSHOP") requireRole(authenticatedSession, "admin");
         const service = connType === "WORKSHOP" ? "google_drive_workshop" : "google_drive_personal";
 
         await env.DB.prepare(`
@@ -880,11 +889,12 @@ export default {
 
       if (url.pathname === "/api/integrations/google/disconnect" && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        requireRole(authenticatedSession, "reception", "technician", "technical_lead", "cashier");
         const body = await readJson(request) as { connectionType?: string };
         const connectionType = body.connectionType === "WORKSHOP" ? "WORKSHOP" : "PERSONAL";
 
-        if (connectionType === "WORKSHOP" && authenticatedSession.role !== "admin") {
-          return json({ error: "Solo los administradores pueden desconectar el Google Drive del taller" }, 403);
+        if (connectionType === "WORKSHOP") {
+          requireRole(authenticatedSession, "admin");
         }
 
         if (connectionType === "WORKSHOP") {
@@ -909,7 +919,9 @@ export default {
 
       if (url.pathname === "/api/integrations/google/picker-token" && request.method === "GET") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        requireRole(authenticatedSession, "reception", "technician", "technical_lead", "cashier");
         const connType = (url.searchParams.get("connectionType") === "PERSONAL" ? "PERSONAL" : "WORKSHOP") as GoogleConnectionType;
+        if (connType === "WORKSHOP") requireRole(authenticatedSession, "admin");
 
         let conn = null;
         if (connType === "WORKSHOP") {
@@ -974,8 +986,8 @@ export default {
           await env.DB.prepare(`
             UPDATE google_connections
             SET access_token_encrypted=?1, expires_at=?2, updated_at=?3
-            WHERE id=?4
-          `).bind(accessEncrypted, newExpiresAt, now(), conn.id).run();
+            WHERE id=?4 AND workshop_id=?5
+          `).bind(accessEncrypted, newExpiresAt, now(), conn.id, WORKSHOP_ID).run();
         } else {
           accessToken = await decryptSecret(conn.access_token_encrypted, env.OAUTH_TOKEN_ENCRYPTION_KEY);
         }
@@ -994,12 +1006,10 @@ export default {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
         const orderId = orderAttachmentsMatch[1];
         const order = await env.DB.prepare(
-          "SELECT id, workshop_id, assigned_user_id, created_by FROM repair_orders WHERE id=?1 AND workshop_id=?2"
-        ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; assigned_user_id: string | null; created_by: string | null }>();
+          "SELECT id, workshop_id, assigned_user_id, owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; assigned_user_id: string | null; owner_user_id: string | null }>();
         if (!order) return json({ error: "Orden no encontrada" }, 404);
-        if (!canAccessOrder(authenticatedSession, order)) {
-          return json({ error: "No tenés permiso para acceder a los archivos de esta orden" }, 403);
-        }
+        requireOrderAccess(authenticatedSession, order);
         const attachments = await env.DB.prepare(`
           SELECT a.id, a.order_id, a.storage_provider, a.external_file_id, a.file_name,
                  a.mime_type, a.file_size, a.category, a.uploaded_by, a.web_view_link,
@@ -1016,14 +1026,13 @@ export default {
       const orderPhotoUploadMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/attachments\/photo$/);
       if (orderPhotoUploadMatch && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        requireRole(authenticatedSession, "reception", "technician", "technical_lead");
         const orderId = orderPhotoUploadMatch[1];
         const order = await env.DB.prepare(
-          "SELECT id, workshop_id, device_id, assigned_user_id, created_by FROM repair_orders WHERE id=?1 AND workshop_id=?2"
-        ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; device_id: string | null; assigned_user_id: string | null; created_by: string | null }>();
+          "SELECT id, workshop_id, device_id, assigned_user_id, owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; device_id: string | null; assigned_user_id: string | null; owner_user_id: string | null }>();
         if (!order) return json({ error: "Orden no encontrada" }, 404);
-        if (!canAccessOrder(authenticatedSession, order)) {
-          return json({ error: "No tenés permiso para subir fotografías a esta orden" }, 403);
-        }
+        requireOrderAccess(authenticatedSession, order);
         if (!env.FILES) {
           return json({ error: "El almacenamiento R2 no está configurado en este entorno" }, 503);
         }
@@ -1109,7 +1118,7 @@ export default {
         const attachmentId = attachmentContentMatch[1];
         const attachment = await env.DB.prepare(`
           SELECT a.id, a.workshop_id, a.order_id, a.storage_provider, a.object_key,
-                 a.file_name, a.mime_type, ro.assigned_user_id, ro.created_by
+                 a.file_name, a.mime_type, ro.assigned_user_id, ro.owner_user_id
           FROM order_attachments a
           JOIN repair_orders ro ON ro.id = a.order_id
           WHERE a.id=?1 AND a.workshop_id=?2 AND a.deleted_at IS NULL
@@ -1122,13 +1131,11 @@ export default {
           file_name: string;
           mime_type: string;
           assigned_user_id: string | null;
-          created_by: string | null;
+          owner_user_id: string | null;
         }>();
 
         if (!attachment) return json({ error: "Archivo no encontrado" }, 404);
-        if (!canAccessOrder(authenticatedSession, attachment)) {
-          return json({ error: "No tenés permiso para ver este archivo" }, 403);
-        }
+        requireOrderAccess(authenticatedSession, attachment);
         if (attachment.storage_provider !== "R2" || !attachment.object_key) {
           return json({ error: "Este archivo no se almacena en R2" }, 400);
         }
@@ -1156,14 +1163,13 @@ export default {
       const orderDriveLinkMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/attachments\/drive$/);
       if (orderDriveLinkMatch && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        requireRole(authenticatedSession, "reception", "technician", "technical_lead");
         const orderId = orderDriveLinkMatch[1];
         const order = await env.DB.prepare(
-          "SELECT id, workshop_id, device_id, assigned_user_id, created_by FROM repair_orders WHERE id=?1 AND workshop_id=?2"
-        ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; device_id: string | null; assigned_user_id: string | null; created_by: string | null }>();
+          "SELECT id, workshop_id, device_id, assigned_user_id, owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; device_id: string | null; assigned_user_id: string | null; owner_user_id: string | null }>();
         if (!order) return json({ error: "Orden no encontrada" }, 404);
-        if (!canAccessOrder(authenticatedSession, order)) {
-          return json({ error: "No tenés permiso para adjuntar documentos a esta orden" }, 403);
-        }
+        requireOrderAccess(authenticatedSession, order);
 
         const body = await readJson(request) as {
           driveFileId?: string;
@@ -1180,6 +1186,7 @@ export default {
         const mimeType = body.mimeType || "application/octet-stream";
         const webViewLink = body.webViewLink || null;
         const origin = (body.origin === "WORKSHOP" ? "WORKSHOP" : "PERSONAL") as GoogleConnectionType;
+        if (origin === "WORKSHOP") requireRole(authenticatedSession, "admin");
         const category = isValidCategory(body.category ?? "") ? body.category! : "OTROS";
 
         let sourceConn = null;
@@ -1239,11 +1246,12 @@ export default {
       const orderAttachmentDeleteMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/attachments\/([^/]+)$/);
       if (orderAttachmentDeleteMatch && request.method === "DELETE") {
         if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        requireRole(authenticatedSession, "reception", "technician", "technical_lead");
         const orderId = orderAttachmentDeleteMatch[1];
         const attachmentId = orderAttachmentDeleteMatch[2];
 
         const attachment = await env.DB.prepare(`
-          SELECT a.id, a.workshop_id, a.order_id, a.uploaded_by, ro.assigned_user_id, ro.created_by
+          SELECT a.id, a.workshop_id, a.order_id, a.uploaded_by, ro.assigned_user_id, ro.owner_user_id
           FROM order_attachments a
           JOIN repair_orders ro ON ro.id = a.order_id
           WHERE a.id=?1 AND a.order_id=?2 AND a.workshop_id=?3 AND a.deleted_at IS NULL
@@ -1253,10 +1261,11 @@ export default {
           order_id: string;
           uploaded_by: string;
           assigned_user_id: string | null;
-          created_by: string | null;
+          owner_user_id: string | null;
         }>();
 
         if (!attachment) return json({ error: "Archivo adjunto no encontrado" }, 404);
+        requireOrderAccess(authenticatedSession, attachment);
 
         const canDelete = authenticatedSession.role === "admin" || attachment.uploaded_by === authenticatedSession.id;
         if (!canDelete) {
@@ -1280,7 +1289,7 @@ export default {
           env.DB.prepare(`
             SELECT p.id,p.sku,p.name,p.minimum_stock,
               COALESCE(SUM(CASE WHEN sm.kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN sm.quantity ELSE -sm.quantity END),0) AS stock
-            FROM parts p LEFT JOIN stock_movements sm ON sm.part_id=p.id
+            FROM parts p LEFT JOIN stock_movements sm ON sm.part_id=p.id AND sm.workshop_id=p.workshop_id
             WHERE p.workshop_id=?1 AND p.status='ACTIVO' GROUP BY p.id HAVING stock <= p.minimum_stock
           `).bind(WORKSHOP_ID).all(),
           env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN kind='REFUND' THEN -amount_minor ELSE amount_minor END),0) AS total FROM payment_transactions WHERE workshop_id=?1").bind(WORKSHOP_ID).first<number>("total")
@@ -1312,6 +1321,7 @@ export default {
 
       if (url.pathname === "/api/customers" && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para crear clientes" }, 401);
+        requireRole(authenticatedSession, "reception");
         const body = await readJson(request);
         const id = uuid();
         const timestamp = now();
@@ -1349,16 +1359,19 @@ export default {
           ).bind(customerId, WORKSHOP_ID).all(),
           env.DB.prepare(`
             SELECT ro.id,ro.reference,ro.reported_issue,ro.priority,ro.status,ro.received_at,ro.created_at,ro.updated_at,
+                   ro.workshop_id,ro.assigned_user_id,ro.owner_user_id,
                    d.brand,d.model
             FROM repair_orders ro JOIN devices d ON d.id=ro.device_id
             WHERE ro.customer_id=?1 AND ro.workshop_id=?2 ORDER BY ro.created_at DESC
-          `).bind(customerId, WORKSHOP_ID).all()
+          `).bind(customerId, WORKSHOP_ID).all<{ workshop_id: string; assigned_user_id: string | null; owner_user_id: string | null } & Record<string, unknown>>()
         ]);
-        return json({ customer, devices: devices.results, orders: orders.results });
+        const visibleOrders = orders.results.filter((order) => canAccessOrder(authenticatedSession, order));
+        return json({ customer, devices: devices.results, orders: visibleOrders });
       }
 
       if (customerMatch && request.method === "PATCH") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para editar clientes" }, 401);
+        requireRole(authenticatedSession, "reception");
         const customerId = customerMatch[1];
         const existing = await env.DB.prepare(
           "SELECT owner_user_id FROM customers WHERE id=?1 AND workshop_id=?2"
@@ -1379,7 +1392,7 @@ export default {
           body.email ? text(body.email, "Email") : null,
           body.address ? text(body.address, "Dirección") : null,
           body.observations ? text(body.observations, "Observaciones") : null,
-          body.status ? text(body.status, "Estado").toUpperCase() : "ACTIVO",
+          "ACTIVO",
           now(), customerId, WORKSHOP_ID
         ).run();
         await audit(env.DB, "customer.updated", "customer", customerId);
@@ -1388,6 +1401,7 @@ export default {
 
       if (customerMatch && request.method === "DELETE") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para eliminar clientes" }, 401);
+        requireRole(authenticatedSession, "admin");
         const customerId = customerMatch[1];
         const existing = await env.DB.prepare(
           "SELECT owner_user_id,name,status FROM customers WHERE id=?1 AND workshop_id=?2"
@@ -1448,11 +1462,15 @@ export default {
 
       if (url.pathname === "/api/devices" && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para registrar equipos" }, 401);
+        requireRole(authenticatedSession, "reception", "technical_lead");
         const body = await readJson(request);
+        const customerId = text(body.customerId, "Cliente");
+        const customer = await env.DB.prepare("SELECT id FROM customers WHERE id=?1 AND workshop_id=?2 AND status='ACTIVO'").bind(customerId, WORKSHOP_ID).first("id");
+        if (!customer) return json({ error: "Cliente no válido" }, 400);
         const id = uuid();
         await env.DB.prepare(
           "INSERT INTO devices (id,workshop_id,customer_id,category,brand,model,serial_number,physical_condition,reported_fault,accessories,owner_user_id,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"
-        ).bind(id, WORKSHOP_ID, text(body.customerId, "Cliente"), text(body.category, "Categoría"), text(body.brand, "Marca"), text(body.model, "Modelo"), body.serialNumber ? text(body.serialNumber, "Serie/IMEI") : null, body.physicalCondition ? text(body.physicalCondition, "Condición") : null, body.reportedFault ? text(body.reportedFault, "Falla") : null, body.accessories ? text(body.accessories, "Accesorios") : null, authenticatedSession.id, now()).run();
+        ).bind(id, WORKSHOP_ID, customerId, text(body.category, "Categoría"), text(body.brand, "Marca"), text(body.model, "Modelo"), body.serialNumber ? text(body.serialNumber, "Serie/IMEI") : null, body.physicalCondition ? text(body.physicalCondition, "Condición") : null, body.reportedFault ? text(body.reportedFault, "Falla") : null, body.accessories ? text(body.accessories, "Accesorios") : null, authenticatedSession.id, now()).run();
         await audit(env.DB, "device.created", "device", id);
         return json({ id }, 201);
       }
@@ -1479,6 +1497,7 @@ export default {
         const result = await env.DB.prepare(`
           SELECT ro.id,ro.reference,ro.reported_issue,ro.priority,ro.status,ro.created_at,
                  ro.received_at,ro.observations,ro.accessories,ro.assigned_user_id,
+                 ro.workshop_id,ro.owner_user_id,
                  c.id AS customer_id,c.name AS customer_name,c.phone AS customer_phone,
                  d.id AS device_id,d.category,d.brand,d.model,d.serial_number,d.physical_condition,d.reported_fault,
                  u.name AS technician_name,
@@ -1488,12 +1507,14 @@ export default {
           JOIN devices d ON d.id=ro.device_id
           LEFT JOIN users u ON u.id=ro.assigned_user_id
           WHERE ro.workshop_id=?1 ORDER BY ro.created_at DESC LIMIT 100
-        `).bind(WORKSHOP_ID).all();
-        return json({ orders: result.results });
+        `).bind(WORKSHOP_ID).all<{ workshop_id: string; assigned_user_id: string | null; owner_user_id: string | null } & Record<string, unknown>>();
+        const visibleOrders = result.results.filter((order) => canAccessOrder(authenticatedSession, order));
+        return json({ orders: visibleOrders });
       }
 
       if (url.pathname === "/api/orders" && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para crear órdenes" }, 401);
+        requireRole(authenticatedSession, "reception", "technical_lead");
         const body = await readJson(request);
         const id = uuid();
         const timestamp = now();
@@ -1516,6 +1537,14 @@ export default {
         if (!(ORDER_STATUSES as readonly string[]).includes(status)) return json({ error: "Estado inicial no válido" }, 400);
         if (status !== "RECEIVED") return json({ error: "La orden debe iniciar en estado Recibida" }, 400);
         const receivedAt = body.receivedAt ? parseDateTimeLocalToUtcIso(text(body.receivedAt, "Fecha de recepción")) : timestamp;
+        let assignedUserId: string | null = null;
+        if (body.assignedUserId) {
+          assignedUserId = text(body.assignedUserId, "Técnico");
+          const assignedUser = await env.DB.prepare(
+            "SELECT id FROM users WHERE id=?1 AND workshop_id=?2 AND status='APPROVED' AND deactivated_at IS NULL"
+          ).bind(assignedUserId, WORKSHOP_ID).first("id");
+          if (!assignedUser) return json({ error: "Técnico no válido" }, 400);
+        }
         await env.DB.batch([
           env.DB.prepare(
             "INSERT INTO repair_orders (id,workshop_id,customer_id,device_id,reference,reported_issue,priority,status,estimated_completion_at,received_at,observations,accessories,assigned_user_id,owner_user_id,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"
@@ -1528,14 +1557,14 @@ export default {
             receivedAt,
             body.observations ? text(body.observations, "Observaciones") : null,
             body.accessories ? text(body.accessories, "Accesorios") : null,
-            body.assignedUserId ? text(body.assignedUserId, "Técnico") : null,
+            assignedUserId,
             authenticatedSession.id, timestamp, timestamp
           ),
           env.DB.prepare(
             "INSERT INTO order_status_events (id,workshop_id,order_id,from_status,to_status,actor_id,reason,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
-          ).bind(uuid(), WORKSHOP_ID, id, null, "RECEIVED", null, "Orden creada", timestamp)
+          ).bind(uuid(), WORKSHOP_ID, id, null, "RECEIVED", authenticatedSession.id, "Orden creada", timestamp)
         ]);
-        await audit(env.DB, "order.created", "repair_order", id, { reference });
+        await audit(env.DB, "order.created", "repair_order", id, { reference }, authenticatedSession.id);
         return json({ id, reference }, 201);
       }
 
@@ -1554,6 +1583,7 @@ export default {
           WHERE ro.id=?1 AND ro.workshop_id=?2
         `).bind(orderId, WORKSHOP_ID).first();
         if (!order) return json({ error: "Orden no encontrada" }, 404);
+        requireOrderAccess(authenticatedSession, order);
         const [events, diagnostics, quotes, payments] = await Promise.all([
           env.DB.prepare("SELECT * FROM order_status_events WHERE order_id=?1 AND workshop_id=?2 ORDER BY created_at DESC").bind(orderId, WORKSHOP_ID).all(),
           env.DB.prepare("SELECT * FROM diagnostics WHERE order_id=?1 AND workshop_id=?2 ORDER BY created_at DESC").bind(orderId, WORKSHOP_ID).all(),
@@ -1566,13 +1596,20 @@ export default {
       if (orderDetailMatch && request.method === "PATCH") {
         const orderId = orderDetailMatch[1];
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para editar órdenes" }, 401);
+        requireRole(authenticatedSession, "reception", "technician", "technical_lead");
         const body = await readJson(request);
         const order = await env.DB.prepare(
-          "SELECT id,owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
-        ).bind(orderId, WORKSHOP_ID).first<{ id: string; owner_user_id: string | null }>();
+          "SELECT id,workshop_id,owner_user_id,assigned_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; owner_user_id: string | null; assigned_user_id: string | null }>();
         if (!order) return json({ error: "Orden no encontrada" }, 404);
-        if (!ownsOrCanAdmin(authenticatedSession, order.owner_user_id)) {
-          return json({ error: "No tienes permiso para editar esta orden" }, 403);
+        requireOrderAccess(authenticatedSession, order);
+        let assignedUserId: string | null = null;
+        if (body.assignedUserId) {
+          assignedUserId = text(body.assignedUserId, "Técnico");
+          const assignedUser = await env.DB.prepare(
+            "SELECT id FROM users WHERE id=?1 AND workshop_id=?2 AND status='APPROVED' AND deactivated_at IS NULL"
+          ).bind(assignedUserId, WORKSHOP_ID).first("id");
+          if (!assignedUser) return json({ error: "Técnico no válido" }, 400);
         }
         await env.DB.batch([
           env.DB.prepare(`
@@ -1587,7 +1624,7 @@ export default {
             body.receivedAt ? parseDateTimeLocalToUtcIso(text(body.receivedAt, "Fecha de recepción")) : now(),
             body.observations ? text(body.observations, "Observaciones") : null,
             body.accessories ? text(body.accessories, "Accesorios") : null,
-            body.assignedUserId ? text(body.assignedUserId, "Técnico") : null,
+            assignedUserId,
             now(), orderId, WORKSHOP_ID
           ),
           env.DB.prepare(
@@ -1610,13 +1647,12 @@ export default {
       if (orderDetailMatch && request.method === "DELETE") {
         const orderId = orderDetailMatch[1];
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para eliminar órdenes" }, 401);
+        requireRole(authenticatedSession, "admin");
         const order = await env.DB.prepare(
-          "SELECT id,device_id,owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
-        ).bind(orderId, WORKSHOP_ID).first<{ id: string; device_id: string; owner_user_id: string | null }>();
+          "SELECT id,workshop_id,device_id,owner_user_id,assigned_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; device_id: string; owner_user_id: string | null; assigned_user_id: string | null }>();
         if (!order) return json({ error: "Orden no encontrada" }, 404);
-        if (!ownsOrCanAdmin(authenticatedSession, order.owner_user_id)) {
-          return json({ error: "No tienes permiso para eliminar esta orden" }, 403);
-        }
+        requireOrderAccess(authenticatedSession, order);
         const dependencies = await env.DB.prepare(`
           SELECT
             (SELECT COUNT(*) FROM diagnostics WHERE order_id=?1) +
@@ -1639,18 +1675,20 @@ export default {
       const statusMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/status$/);
       if (statusMatch && request.method === "PATCH") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para cambiar estados" }, 401);
+        requireRole(authenticatedSession, "reception", "technician", "technical_lead");
         const body = await readJson(request);
         const orderId = statusMatch[1];
         const toStatus = text(body.status, "Estado").toUpperCase() as OrderStatus;
         const order = await env.DB.prepare(
-          "SELECT status,owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
-        ).bind(orderId, WORKSHOP_ID).first<{ status: OrderStatus; owner_user_id: string | null }>();
+          "SELECT workshop_id,status,owner_user_id,assigned_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+        ).bind(orderId, WORKSHOP_ID).first<{ workshop_id: string; status: OrderStatus; owner_user_id: string | null; assigned_user_id: string | null }>();
         if (!order) return json({ error: "Orden no encontrada" }, 404);
-        if (!ownsOrCanAdmin(authenticatedSession, order.owner_user_id)) {
-          return json({ error: "No tienes permiso para cambiar esta orden" }, 403);
-        }
+        requireOrderAccess(authenticatedSession, order);
         if (!canTransition(order.status, toStatus)) {
           return json({ error: `Transición inválida: ${order.status} → ${toStatus}` }, 409);
+        }
+        if (toStatus === "APPROVED" || toStatus === "REJECTED") {
+          requireRole(authenticatedSession, "technical_lead");
         }
         if (toStatus === "APPROVED") {
           const approved = await env.DB.prepare(
@@ -1663,26 +1701,34 @@ export default {
           env.DB.prepare("UPDATE repair_orders SET status=?1,updated_at=?2 WHERE id=?3 AND workshop_id=?4").bind(toStatus, timestamp, orderId, WORKSHOP_ID),
           env.DB.prepare(
             "INSERT INTO order_status_events (id,workshop_id,order_id,from_status,to_status,actor_id,reason,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
-          ).bind(uuid(), WORKSHOP_ID, orderId, order.status, toStatus, null, body.reason ? text(body.reason, "Motivo") : null, timestamp)
+          ).bind(uuid(), WORKSHOP_ID, orderId, order.status, toStatus, authenticatedSession.id, body.reason ? text(body.reason, "Motivo") : null, timestamp)
         ]);
-        await audit(env.DB, "order.status_changed", "repair_order", orderId, { from: order.status, to: toStatus });
+        await audit(env.DB, "order.status_changed", "repair_order", orderId, { from: order.status, to: toStatus }, authenticatedSession.id);
         return json({ status: toStatus });
       }
 
       if (url.pathname.match(/^\/api\/orders\/[^/]+\/diagnostics$/) && request.method === "POST") {
-        const body = await readJson(request);
         const orderId = url.pathname.split("/")[3];
+        const actor = requireRole(authenticatedSession, "technician", "technical_lead");
+        const order = await env.DB.prepare("SELECT id,workshop_id,assigned_user_id,owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2").bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; assigned_user_id: string | null; owner_user_id: string | null }>();
+        if (!order) return json({ error: "Orden no encontrada" }, 404);
+        requireOrderAccess(actor, order);
+        const body = await readJson(request);
         const id = uuid();
         await env.DB.prepare(
           "INSERT INTO diagnostics (id,workshop_id,order_id,findings,certainty,recommendation,actor_id,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
-        ).bind(id, WORKSHOP_ID, orderId, text(body.findings, "Hallazgos"), text(body.certainty, "Certeza"), body.recommendation ? text(body.recommendation, "Recomendación") : null, null, now()).run();
-        await audit(env.DB, "diagnostic.created", "diagnostic", id);
+        ).bind(id, WORKSHOP_ID, orderId, text(body.findings, "Hallazgos"), text(body.certainty, "Certeza"), body.recommendation ? text(body.recommendation, "Recomendación") : null, actor.id, now()).run();
+        await audit(env.DB, "diagnostic.created", "diagnostic", id, null, actor.id);
         return json({ id }, 201);
       }
 
       if (url.pathname.match(/^\/api\/orders\/[^/]+\/quotes$/) && request.method === "POST") {
-        const body = await readJson(request);
         const orderId = url.pathname.split("/")[3];
+        const actor = requireRole(authenticatedSession, "reception", "technical_lead");
+        const order = await env.DB.prepare("SELECT id,workshop_id,assigned_user_id,owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2").bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; assigned_user_id: string | null; owner_user_id: string | null }>();
+        if (!order) return json({ error: "Orden no encontrada" }, 404);
+        requireOrderAccess(actor, order);
+        const body = await readJson(request);
         const lines = body.lines;
         if (!Array.isArray(lines) || lines.length === 0) throw new Error("El presupuesto requiere partidas");
         const quoteId = uuid();
@@ -1704,28 +1750,47 @@ export default {
         }
         const tax = integer(body.taxMinor ?? 0, "Impuesto");
         const total = subtotal + tax;
-        const status = body.status === "approved" ? "approved" : "draft";
+        const status = "draft";
         statements.unshift(
           env.DB.prepare(
             "INSERT INTO quote_versions (id,workshop_id,order_id,version,subtotal_minor,tax_minor,total_minor,status,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"
           ).bind(quoteId, WORKSHOP_ID, orderId, version, subtotal, tax, total, status, body.expiresAt ? text(body.expiresAt, "Vencimiento") : null, now())
         );
         await env.DB.batch(statements);
-        await audit(env.DB, "quote.created", "quote", quoteId, { status, totalMinor: total });
+        await audit(env.DB, "quote.created", "quote", quoteId, { status, totalMinor: total }, actor.id);
         return json({ id: quoteId, subtotalMinor: subtotal, totalMinor: total, status }, 201);
       }
 
+      const quoteApprovalMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/quotes\/([^/]+)\/approve$/);
+      if (quoteApprovalMatch && request.method === "PATCH") {
+        const actor = requireRole(authenticatedSession, "technical_lead");
+        const orderId = quoteApprovalMatch[1];
+        const quoteId = quoteApprovalMatch[2];
+        const order = await env.DB.prepare("SELECT id,workshop_id,assigned_user_id,owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2").bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; assigned_user_id: string | null; owner_user_id: string | null }>();
+        if (!order) return json({ error: "Orden no encontrada" }, 404);
+        requireOrderAccess(actor, order);
+        const quote = await env.DB.prepare("SELECT id FROM quote_versions WHERE id=?1 AND order_id=?2 AND workshop_id=?3 AND status='draft'").bind(quoteId, orderId, WORKSHOP_ID).first("id");
+        if (!quote) return json({ error: "Presupuesto no encontrado o no está en borrador" }, 404);
+        await env.DB.prepare("UPDATE quote_versions SET status='approved' WHERE id=?1 AND order_id=?2 AND workshop_id=?3 AND status='draft'").bind(quoteId, orderId, WORKSHOP_ID).run();
+        await audit(env.DB, "quote.approved", "quote", quoteId, { orderId }, actor.id);
+        return json({ id: quoteId, status: "approved" });
+      }
+
       if (url.pathname.match(/^\/api\/orders\/[^/]+\/payments$/) && request.method === "POST") {
-        const body = await readJson(request);
         const orderId = url.pathname.split("/")[3];
+        const actor = requireRole(authenticatedSession, "cashier");
+        const order = await env.DB.prepare("SELECT id,workshop_id,assigned_user_id,owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2").bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; assigned_user_id: string | null; owner_user_id: string | null }>();
+        if (!order) return json({ error: "Orden no encontrada" }, 404);
+        requireOrderAccess(actor, order);
+        const body = await readJson(request);
         const amount = integer(body.amountMinor, "Importe");
         if (amount <= 0) throw new Error("El importe debe ser positivo");
         const kind = body.kind === "REFUND" ? "REFUND" : "PAYMENT";
         const id = uuid();
         await env.DB.prepare(
           "INSERT INTO payment_transactions (id,workshop_id,order_id,kind,amount_minor,method,reference,actor_id,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
-        ).bind(id, WORKSHOP_ID, orderId, kind, amount, text(body.method, "Método"), body.reference ? text(body.reference, "Referencia") : null, null, now()).run();
-        await audit(env.DB, kind === "REFUND" ? "payment.refunded" : "payment.created", "payment", id, { amountMinor: amount });
+        ).bind(id, WORKSHOP_ID, orderId, kind, amount, text(body.method, "Método"), body.reference ? text(body.reference, "Referencia") : null, actor.id, now()).run();
+        await audit(env.DB, kind === "REFUND" ? "payment.refunded" : "payment.created", "payment", id, { amountMinor: amount }, actor.id);
         return json({ id }, 201);
       }
 
@@ -2263,7 +2328,7 @@ export default {
           SELECT p.id,p.sku,p.name,p.category,p.location,p.cost_minor,p.sale_price_minor,p.minimum_stock,
                  p.status,p.archived_at,p.created_at,p.updated_at,
             COALESCE(SUM(CASE WHEN sm.kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN sm.quantity ELSE -sm.quantity END),0) AS stock
-          FROM parts p LEFT JOIN stock_movements sm ON sm.part_id=p.id
+          FROM parts p LEFT JOIN stock_movements sm ON sm.part_id=p.id AND sm.workshop_id=p.workshop_id
           WHERE p.workshop_id=?1 GROUP BY p.id ORDER BY
             CASE WHEN p.status='ACTIVO' THEN 0 ELSE 1 END,
             p.name
@@ -2273,7 +2338,7 @@ export default {
 
       if (url.pathname === "/api/parts" && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para administrar inventario" }, 401);
-        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para administrar inventario" }, 401);
+        requireRole(authenticatedSession, "admin");
         const body = await readJson(request);
         const id = uuid();
         const timestamp = now();
@@ -2304,6 +2369,7 @@ export default {
       const movementMatch = url.pathname.match(/^\/api\/parts\/([^/]+)\/movements$/);
       if (movementMatch && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para registrar movimientos" }, 401);
+        requireRole(authenticatedSession, "reception", "technician", "technical_lead", "admin");
         const body = await readJson(request);
         const partId = movementMatch[1];
         const reference = body.reference ? text(body.reference, "Referencia") : null;
@@ -2323,6 +2389,15 @@ export default {
           FROM stock_movements WHERE part_id=?1 AND workshop_id=?2
         `).bind(partId, WORKSHOP_ID).first<{ stock: number }>();
         const stock = stockRow?.stock ?? 0;
+        let orderId: string | null = null;
+        if (body.orderId) {
+          orderId = text(body.orderId, "Orden");
+          const order = await env.DB.prepare(
+            "SELECT id,workshop_id,assigned_user_id,owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+          ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; assigned_user_id: string | null; owner_user_id: string | null }>();
+          if (!order) return json({ error: "Orden no encontrada" }, 404);
+          requireOrderAccess(authenticatedSession, order);
+        }
         const requestedKind = body.kind ? text(body.kind, "Tipo").toUpperCase() : null;
         let kind: string;
         let quantity: number;
@@ -2345,7 +2420,7 @@ export default {
         await env.DB.batch([
           env.DB.prepare(
             "INSERT INTO stock_movements (id,workshop_id,part_id,order_id,kind,quantity,reason,actor_id,created_at,stock_before,stock_after,reference) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"
-          ).bind(id, WORKSHOP_ID, partId, body.orderId ? text(body.orderId, "Orden") : null, kind, quantity, text(body.reason, "Motivo"), authenticatedSession.id, now(), stock, stockAfter, reference),
+          ).bind(id, WORKSHOP_ID, partId, orderId, kind, quantity, text(body.reason, "Motivo"), authenticatedSession.id, now(), stock, stockAfter, reference),
           env.DB.prepare(
             "UPDATE parts SET updated_at=?1 WHERE id=?2 AND workshop_id=?3"
           ).bind(now(), partId, WORKSHOP_ID)
@@ -2392,6 +2467,7 @@ export default {
       const movementReverseMatch = url.pathname.match(/^\/api\/inventory\/movements\/([^/]+)\/reverse$/);
       if (movementReverseMatch && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para revertir movimientos" }, 401);
+        requireRole(authenticatedSession, "reception", "technician", "technical_lead", "admin");
         const movementId = movementReverseMatch[1];
         const original = await env.DB.prepare(`
           SELECT id,part_id,kind,quantity,reference
@@ -2432,6 +2508,7 @@ export default {
       const partStatusMatch = url.pathname.match(/^\/api\/parts\/([^/]+)\/status$/);
       if (partStatusMatch && request.method === "PATCH") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para cambiar el estado" }, 401);
+        requireRole(authenticatedSession, "admin");
         const partId = partStatusMatch[1];
         const body = await readJson(request);
         const status = text(body.status, "Estado").toUpperCase();
@@ -2455,7 +2532,7 @@ export default {
           SELECT p.id,p.sku,p.name,p.category,p.location,p.cost_minor,p.sale_price_minor,p.minimum_stock,
                  p.status,p.archived_at,p.created_at,p.updated_at,
                  COALESCE(SUM(CASE WHEN sm.kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN sm.quantity ELSE -sm.quantity END),0) AS stock
-          FROM parts p LEFT JOIN stock_movements sm ON sm.part_id=p.id
+          FROM parts p LEFT JOIN stock_movements sm ON sm.part_id=p.id AND sm.workshop_id=p.workshop_id
           WHERE p.id=?1 AND p.workshop_id=?2 GROUP BY p.id
         `).bind(partId, WORKSHOP_ID).first();
         if (!part) return json({ error: "Repuesto no encontrado" }, 404);
@@ -2469,6 +2546,7 @@ export default {
 
       if (partDetailMatch && request.method === "PATCH") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para editar inventario" }, 401);
+        requireRole(authenticatedSession, "admin");
         const partId = partDetailMatch[1];
         const body = await readJson(request);
         const part = await env.DB.prepare(
@@ -2500,6 +2578,7 @@ export default {
 
       if (partDetailMatch && request.method === "DELETE") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para eliminar inventario" }, 401);
+        requireRole(authenticatedSession, "admin");
         const partId = partDetailMatch[1];
         const part = await env.DB.prepare(
           "SELECT id, status FROM parts WHERE id=?1 AND workshop_id=?2"
@@ -2532,6 +2611,7 @@ export default {
 
       return env.ASSETS.fetch(request);
     } catch (error) {
+      if (error instanceof AuthorizationError) return json({ error: error.message }, error.status);
       const message = error instanceof Error ? error.message : "Error interno";
       const status = error instanceof SyntaxError || /obligatorio|inválid|positivo|entero|JSON/.test(message) ? 400 : 500;
       return json({ error: message }, status);

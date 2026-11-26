@@ -17,7 +17,11 @@ La aplicación incluye un panel operativo y secciones para clientes, equipos, ó
 
 ## Acceso y autenticación
 
-Las operaciones de negocio (clientes, equipos, órdenes, inventario, dashboard) requieren una sesión aprobada. Las funciones administrativas, la gestión de cuentas Google autorizadas y las credenciales OAuth permanecen protegidas por sesión aprobada. El asistente virtual público (consultas y solicitudes) sigue disponible sin login.
+Las operaciones de negocio (clientes, equipos, órdenes, diagnósticos, presupuestos, pagos, inventario, adjuntos y dashboard) requieren una sesión aprobada. El servidor aplica **deny-by-default**: toda ruta `/api/*` exige autenticación, taller autorizado y rol salvo una allowlist mínima (`/api/health`, configuración/identidad pública de auth, login/logout y endpoints públicos con consentimiento/rate limiting del asistente). No se confía en `workshop_id`, `tenant_id`, rol, owner, actor, total ni estado enviados por el cliente; se derivan de la sesión y se validan contra persistencia.
+
+Roles server-side: `viewer` (solo lectura), `reception`, `technician`, `technical_lead`, `cashier`, `admin`. La creación, edición, aprobación, cobro, administración y eliminación son permisos separados. `requireOrderAccess` verifica taller + rol + propiedad/asignación de la orden. `technical_lead` aprueba presupuestos/órdenes; `cashier` registra pagos/reembolsos; `admin` administra y elimina. Un presupuesto se crea `draft` y se aprueba explícitamente con `PATCH /api/orders/:orderId/quotes/:quoteId/approve` por `technical_lead`/`admin`.
+
+Las funciones administrativas, la gestión de cuentas Google autorizadas y las credenciales OAuth permanecen protegidas por sesión aprobada. El asistente virtual público (consultas y solicitudes) sigue disponible sin login con consentimiento y límites.
 
 Los secretos de Google, Gemini y Cloudflare no se exponen al frontend. Configure `GOOGLE_BOOTSTRAP_SUB` antes del primer despliegue para definir el administrador inicial.
 
