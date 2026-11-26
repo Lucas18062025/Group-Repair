@@ -1,3 +1,5 @@
+import { base64UrlDecode, base64UrlEncode } from "../auth";
+
 export type GoogleConnectionType = "WORKSHOP" | "PERSONAL";
 
 export const GOOGLE_DRIVE_SCOPES = [
@@ -47,6 +49,53 @@ export function deserializeOAuthState(stateStr: string): GoogleAuthStatePayload 
       return parsed;
     }
     return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * OAuth state is base64url(JSON).signature so the payload cannot be altered by the browser.
+ * The signed value is also validated against the one-time row in oauth_states by the Worker.
+ */
+export async function signOAuthState(payload: GoogleAuthStatePayload, secret: string | undefined): Promise<string> {
+  if (!secret) throw new Error("Falta la clave de firma de OAuth");
+  const encoded = serializeOAuthState(payload);
+  const keyBytes = base64UrlDecode(secret);
+  if (keyBytes.length !== 32) throw new Error("La clave de firma de OAuth debe tener 32 bytes");
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new Uint8Array(keyBytes).buffer as ArrayBuffer,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(encoded));
+  return `${encoded}.${base64UrlEncode(new Uint8Array(signature))}`;
+}
+
+export async function verifyOAuthState(value: string, secret: string | undefined): Promise<GoogleAuthStatePayload | null> {
+  if (!secret) return null;
+  const parts = value.split(".");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  const payload = deserializeOAuthState(parts[0]);
+  if (!payload) return null;
+  const keyBytes = base64UrlDecode(secret);
+  if (keyBytes.length !== 32) return null;
+  try {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new Uint8Array(keyBytes).buffer as ArrayBuffer,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["verify"]
+    );
+    return await crypto.subtle.verify(
+      "HMAC",
+      key,
+      new Uint8Array(base64UrlDecode(parts[1])).buffer as ArrayBuffer,
+      new TextEncoder().encode(parts[0])
+    ) ? payload : null;
   } catch {
     return null;
   }

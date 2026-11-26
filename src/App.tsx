@@ -34,19 +34,20 @@ interface AuthMe {
 interface AuthConfig {
   googleConfigured: boolean;
   googleClientId: string | null;
-  geminiConfigured: boolean;
+  r2Configured: boolean;
 }
 
-interface IntegrationConnection {
-  service: string;
-  account_email: string | null;
-  status: string;
-  scopes: string | null;
-  expires_at: string | null;
-  connected_at: string | null;
-  last_sync_at: string | null;
-  error: string | null;
-  updated_at: string;
+interface GoogleConnectionState {
+  connected: boolean;
+  email: string | null;
+  connectedAt: string | null;
+}
+
+interface IntegrationStatus {
+  googleConfigured: boolean;
+  r2Configured: boolean;
+  workshop: GoogleConnectionState;
+  personal: GoogleConnectionState;
 }
 
 interface GoogleAllowlistAccount {
@@ -283,11 +284,8 @@ export default function App() {
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [googleSub, setGoogleSub] = useState<string | null>(null);
   const [authConfig, setAuthConfig] = useState<AuthConfig | null>(null);
-  const [integrations, setIntegrations] = useState<IntegrationConnection[]>([]);
+  const [integrationStatus, setIntegrationStatus] = useState<IntegrationStatus | null>(null);
   const [showIntegrationsPanel, setShowIntegrationsPanel] = useState(false);
-  const [showGeminiPanel, setShowGeminiPanel] = useState(false);
-  const [geminiPrompt, setGeminiPrompt] = useState("");
-  const [geminiAnswer, setGeminiAnswer] = useState("");
   const [adminUsers, setAdminUsers] = useState<AuthUser[]>([]);
   const [googleAccounts, setGoogleAccounts] = useState<GoogleAllowlistAccount[]>([]);
   const [showLoginOverlay, setShowLoginOverlay] = useState(false);
@@ -509,10 +507,10 @@ export default function App() {
 
   async function loadIntegrations() {
     try {
-      const result = await api<{ connections: IntegrationConnection[] }>("/api/integrations");
-      setIntegrations(result.connections);
+      const result = await api<IntegrationStatus>("/api/integrations/google/status");
+      setIntegrationStatus(result);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "No se pudieron cargar las integraciones");
+      setMessage(error instanceof Error ? error.message : "No se pudo cargar el estado de Google Drive");
     }
   }
 
@@ -697,22 +695,28 @@ export default function App() {
     }
   }
 
-  async function startIntegration(service: "google_drive" | "google_sheets" | "google_photos") {
+  async function startIntegration(connectionType: "WORKSHOP" | "PERSONAL") {
     try {
-      const result = await api<{ authUrl: string }>(`/api/integrations/${service}/start`, { method: "POST" });
+      const result = await api<{ authUrl: string }>("/api/integrations/google/connect", {
+        method: "POST",
+        body: JSON.stringify({ connectionType })
+      });
       window.location.assign(result.authUrl);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "No se pudo iniciar la conexión");
     }
   }
 
-  async function disconnectIntegration(service: "google_drive" | "google_sheets" | "google_photos") {
+  async function disconnectIntegration(connectionType: "WORKSHOP" | "PERSONAL") {
     try {
-      await api(`/api/integrations/${service}/disconnect`, { method: "POST" });
+      await api("/api/integrations/google/disconnect", {
+        method: "POST",
+        body: JSON.stringify({ connectionType })
+      });
       await loadIntegrations();
-      setMessage("Integración desconectada");
+      setMessage("Conexión de Google Drive desactivada");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "No se pudo desconectar");
+      setMessage(error instanceof Error ? error.message : "No se pudo desconectar Google Drive");
     }
   }
 
@@ -776,23 +780,6 @@ export default function App() {
       setMessage("Cuenta Google retirada");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "No se pudo retirar la cuenta");
-    }
-  }
-
-  async function submitGemini(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setBusy(true);
-    setGeminiAnswer("");
-    try {
-      const result = await api<{ answer: string }>("/api/gemini/chat", {
-        method: "POST",
-        body: JSON.stringify({ prompt: geminiPrompt })
-      });
-      setGeminiAnswer(result.answer);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Gemini no pudo responder");
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -2385,44 +2372,27 @@ export default function App() {
               <section className="content">
             <div className="integration-grid">
               {([
-                ["google_drive", "Google Drive", "Adjuntar documentación y archivos de órdenes.", "google_drive"],
-                ["google_sheets", "Google Sheets", "Exportar e importar datos estructurados.", "google_sheets"],
-                ["google_photos", "Google Photos", "Seleccionar fotografías mediante Photos Picker.", "google_photos"]
-              ] as Array<[IntegrationConnection["service"], string, string, "google_drive" | "google_sheets" | "google_photos"]>).map(([service, title, description, serviceKey]) => {
-                const connection = integrations.find((item) => item.service === service);
-                const connected = connection?.status === "connected";
+                ["personal", "Drive personal", "Tu propia cuenta para adjuntar documentación.", integrationStatus?.personal],
+                ...(authUser?.role === "admin" ? [["workshop", "Drive del taller", "Cuenta corporativa de la configuración operativa.", integrationStatus?.workshop] as const] : [])
+              ] as Array<["personal" | "workshop", string, string, GoogleConnectionState | undefined]>).map(([key, title, description, connection]) => {
+                const connectionType = key === "workshop" ? "WORKSHOP" : "PERSONAL";
+                const connected = connection?.connected === true;
                 return (
-                  <article className="panel-card integration-card" key={service}>
+                  <article className="panel-card integration-card" key={key}>
                     <div>
                       <h2>{title}</h2>
                       <p>{description}</p>
                     </div>
                     <span className={`integration-status ${connected ? "connected" : ""}`}>{connected ? "Conectado" : "Desconectado"}</span>
-                    {connection?.account_email && <small>Cuenta: {connection.account_email}</small>}
-                    {connection?.error && <p className="integration-error">{connection.error}</p>}
+                    {connection?.email && <small>Cuenta: {connection.email}</small>}
                     {connected ? (
-                      <button className="secondary" type="button" onClick={() => disconnectIntegration(serviceKey)}>Desconectar</button>
+                      <button className="secondary" type="button" onClick={() => disconnectIntegration(connectionType)}>Desconectar</button>
                     ) : (
-                      <button className="primary" type="button" onClick={() => startIntegration(serviceKey)}>Conectar</button>
+                      <button className="primary" type="button" onClick={() => startIntegration(connectionType)}>Conectar</button>
                     )}
                   </article>
                 );
               })}
-              <article className="panel-card integration-card">
-                <div>
-                  <h2>Gemini</h2>
-                  <p>Asistente técnico de Group Repair Intelligence.</p>
-                </div>
-                <span className={`integration-status ${authConfig?.geminiConfigured ? "connected" : ""}`}>
-                  {authConfig?.geminiConfigured ? "Configurado" : "Pendiente"}
-                </span>
-                {authConfig?.geminiConfigured ? (
-                  <small>API key disponible en Cloudflare Workers.</small>
-                ) : (
-                  <p className="integration-error">Gemini está pendiente de configuración. Es necesario configurar <code>GEMINI_API_KEY</code> en Cloudflare Workers.</p>
-                )}
-                <button className="primary" type="button" onClick={() => { setShowIntegrationsPanel(false); setShowGeminiPanel(true); }}>Abrir Intelligence</button>
-              </article>
             </div>
 
             {authUser?.role === "admin" && (
@@ -2588,29 +2558,6 @@ export default function App() {
           </section>
         )}
 
-        {showGeminiPanel && (
-          <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="gemini-panel-title">
-            <article className="modal-card gemini-panel-modal">
-              <div className="detail-heading"><h2 id="gemini-panel-title">Group Repair Intelligence</h2><button className="overlay-close-inline" type="button" onClick={() => setShowGeminiPanel(false)}>×</button></div>
-              <section className="content">
-            <article className="panel-card gemini-card">
-              <h2>Group Repair Intelligence</h2>
-              {authConfig?.geminiConfigured ? (
-                <form className="form" onSubmit={submitGemini}>
-                  <label>Consulta técnica
-                    <textarea value={geminiPrompt} onChange={(event) => setGeminiPrompt(event.target.value)} maxLength={4000} required />
-                  </label>
-                  <button className="primary" type="submit" disabled={busy}>Consultar</button>
-                </form>
-              ) : (
-                <div className="notice">Gemini pendiente de configuración. Falta configurar el secreto <code>GEMINI_API_KEY</code>.</div>
-              )}
-              {geminiAnswer && <div className="gemini-answer"><strong>Respuesta</strong><p>{geminiAnswer}</p><small>Asistente técnico: confirmar diagnósticos y operaciones con criterio humano.</small></div>}
-            </article>
-              </section>
-            </article>
-          </div>
-        )}
         <footer className="author-footer">
           <span>Diseñado por <a href="https://portafolio.lucaslean1806.workers.dev/" target="_blank" rel="noreferrer">Lucas Villagra | Cybersecurity Analyst</a></span>
           <span>

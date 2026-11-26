@@ -5,6 +5,8 @@ import {
   GOOGLE_DRIVE_SCOPES,
   isTokenExpired,
   serializeOAuthState,
+  signOAuthState,
+  verifyOAuthState,
   type GoogleAuthStatePayload
 } from "./google-drive";
 
@@ -33,6 +35,25 @@ describe("google-drive domain", () => {
   it("rejects corrupted or forged OAuth state", () => {
     expect(deserializeOAuthState("invalid-base64")).toBeNull();
     expect(deserializeOAuthState("")).toBeNull();
+  });
+
+  it("signs OAuth state and rejects modified payloads", async () => {
+    const base64 = (bytes: Uint8Array): string => btoa(String.fromCharCode(...bytes));
+    const secret = base64(new Uint8Array(32).fill(7));
+    const payload: GoogleAuthStatePayload = {
+      csrfToken: "csrf-token",
+      connectionType: "PERSONAL",
+      userId: "usr-1",
+      workshopId: "workshop-main",
+      timestamp: Date.now()
+    };
+    const signed = await signOAuthState(payload, secret);
+    expect(await verifyOAuthState(signed, secret)).toEqual(payload);
+    const forgedPayload = btoa(JSON.stringify({ ...payload, connectionType: "WORKSHOP" }))
+      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const tampered = `${forgedPayload}.${signed.split(".")[1]}`;
+    expect(await verifyOAuthState(tampered, secret)).toBeNull();
+    expect(await verifyOAuthState(signed, base64(new Uint8Array(32).fill(8)))).toBeNull();
   });
 
   it("evaluates token expiration with safety margin", () => {
