@@ -34,14 +34,14 @@ interface GoogleJwk {
   [key: string]: unknown;
 }
 
-function base64UrlDecode(value: string): Uint8Array {
+export function base64UrlDecode(value: string): Uint8Array {
   const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
   const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
   const binary = atob(padded);
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 }
 
-function base64UrlEncode(value: Uint8Array): string {
+export function base64UrlEncode(value: Uint8Array): string {
   let binary = "";
   value.forEach((byte) => { binary += String.fromCharCode(byte); });
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");

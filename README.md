@@ -13,7 +13,7 @@ Group Repair es una aplicación web para gestionar las operaciones de un taller 
 - **Privacidad:** [Política de privacidad](https://group-repair.lucaslean1806.workers.dev/privacy)
 - **Términos:** [Términos de servicio](https://group-repair.lucaslean1806.workers.dev/terms)
 
-La aplicación incluye un panel operativo y secciones para clientes, equipos, órdenes e inventario. El Worker expone operaciones de API para la gestión del taller, con validaciones de dominio, registro de eventos y persistencia en D1. La disponibilidad de servicios externos —por ejemplo, Google o Gemini— depende de la configuración de credenciales y APIs correspondientes.
+La aplicación incluye un panel operativo y secciones para clientes, equipos, órdenes e inventario. El Worker expone operaciones de API para la gestión del taller, con validaciones de dominio, registro de eventos y persistencia en D1. La disponibilidad de servicios externos depende de la configuración de credenciales y APIs correspondientes. Google Drive soporta conexión personal y del taller; los tokens permanecen cifrados en servidor y no se devuelven al navegador. No hay integración activa de Google Sheets ni Google Photos. El asistente público usa Gemini de forma opcional cuando el secreto está configurado.
 
 ## Acceso y autenticación
 
@@ -29,7 +29,7 @@ Los secretos de Google, Gemini y Cloudflare no se exponen al frontend. Configure
 
 Las órdenes muestran detalle completo, relación con cliente/equipo, recepción, observaciones, accesorios, estado, técnico y presupuesto. Los registros vacíos pueden corregirse o eliminarse con protección; una orden con historial asociado no se elimina para preservar trazabilidad.
 
-El stock se calcula exclusivamente desde movimientos de inventario. Al crear un repuesto puede registrarse el stock inicial como movimiento `IN`; las entradas y salidas posteriores se registran como movimientos trazables. Los repuestos existentes sin movimientos conservan el stock calculado disponible y no reciben cantidades inventadas automáticamente.
+El stock se calcula exclusivamente desde movimientos de inventario inmutables. Al crear un repuesto puede registrarse el stock inicial como movimiento `IN`; las entradas, salidas, ajustes y reversiones se registran con actor, motivo, referencia generada en servidor, `stock_before`/`stock_after` y guarda atómica contra escrituras concurrentes. El disponible es `stock - reservas activas`. Las reservas se crean y liberan explícitamente con `POST/DELETE /api/parts/:id/reservations`, quedan auditadas y nunca se eliminan. No existe borrado en cascada de movimientos: un repuesto con historial solo puede archivarse. La auditoría registra actor, `request_id`, timestamp UTC y before/after minimizado en operaciones sensibles.
 
 ## Inventory 2.0
 

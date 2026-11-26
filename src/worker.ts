@@ -31,15 +31,13 @@ import {
   validateImageSignature
 } from "./domain/attachments";
 import {
-  deserializeOAuthState,
   GOOGLE_DRIVE_SCOPES,
   type GoogleConnectionType,
-  isTokenExpired,
-  serializeOAuthState
+  signOAuthState,
+  verifyOAuthState
 } from "./domain/google-drive";
 import {
   clearSessionCookie,
-  decryptSecret,
   encryptSecret,
   parseCookie,
   randomToken,
@@ -101,8 +99,12 @@ interface Env {
 }
 
 const WORKSHOP_ID = "workshop-main";
+const STOCK_SQL = `COALESCE((SELECT SUM(CASE WHEN sm.kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN sm.quantity ELSE -sm.quantity END)
+  FROM stock_movements sm WHERE sm.part_id=p.id AND sm.workshop_id=p.workshop_id),0)`;
+const RESERVED_SQL = `COALESCE((SELECT SUM(pr.quantity)
+  FROM part_reservations pr WHERE pr.part_id=p.id AND pr.workshop_id=p.workshop_id AND pr.status='ACTIVE'),0)`;
 const now = () => new Date().toISOString();
-const uuid = () => crypto.randomUUID();
+const uuid = (): string => crypto.randomUUID();
 
 function statusLabel(status: string): string {
   const labels: Record<string, string> = {
@@ -225,20 +227,6 @@ async function ensureWorkshop(db: D1Database): Promise<void> {
     "INSERT OR IGNORE INTO workshops (id,name,timezone,currency,created_at) VALUES (?1,?2,?3,?4,?5)"
   ).bind(WORKSHOP_ID, "Mi taller", "America/Argentina/Tucuman", "ARS", now()).run();
   await db.prepare(`
-    UPDATE workshops
-    SET timezone=?1,currency=?2,jurisdiction=?3,warranty_phone=?4,
-        opening_schedule=?5,closed_days=?6
-    WHERE id=?7
-  `).bind(
-    "America/Argentina/Tucuman",
-    "ARS",
-    "San Miguel de Tucumán, Tucumán, Argentina",
-    "+54 9 381 524-9553",
-    "Lunes a sábado de 9:00 a 21:00 de corrido",
-    "domingo",
-    WORKSHOP_ID
-  ).run();
-  await db.prepare(`
     INSERT OR IGNORE INTO users
       (id,workshop_id,name,email,role,status,created_at)
     VALUES ('public-visitor',?1,'Visitante público','public@group-repair.local','viewer','APPROVED',?2)
@@ -267,17 +255,27 @@ async function getSession(db: D1Database, request: Request): Promise<SessionUser
   `).bind(tokenHash, now()).first<SessionUser>();
 }
 
-async function audit(
+async function writeAudit(
   db: D1Database,
   action: string,
   entityType: string,
   entityId: string,
   metadata: unknown = null,
-  actorId: string | null = null
+  actorId: string | null = null,
+  requestId = uuid(),
+  before: unknown = null,
+  after: unknown = null
 ): Promise<void> {
   await db.prepare(
-    "INSERT INTO audit_events (id,workshop_id,actor_id,action,entity_type,entity_id,metadata,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
-  ).bind(uuid(), WORKSHOP_ID, actorId, action, entityType, entityId, metadata ? JSON.stringify(metadata) : null, now()).run();
+    `INSERT INTO audit_events
+      (id,workshop_id,actor_id,action,entity_type,entity_id,metadata,created_at,request_id,before_json,after_json)
+      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)`
+  ).bind(
+    uuid(), WORKSHOP_ID, actorId, action, entityType, entityId,
+    metadata ? JSON.stringify(metadata) : null, now(), requestId,
+    before === null ? null : JSON.stringify(before),
+    after === null ? null : JSON.stringify(after)
+  ).run();
 }
 
 function ownsOrCanAdmin(session: SessionUser | null, ownerUserId: string | null): boolean {
@@ -293,6 +291,17 @@ export default {
     try {
       await ensureWorkshop(env.DB);
       const url = new URL(request.url);
+      const requestId = request.headers.get("cf-ray") ?? uuid();
+      const audit = (
+        db: D1Database,
+        action: string,
+        entityType: string,
+        entityId: string,
+        metadata: unknown = null,
+        actorId: string | null = null,
+        before: unknown = null,
+        after: unknown = null
+      ) => writeAudit(db, action, entityType, entityId, metadata, actorId, requestId, before, after);
 
       // CSRF: validar Origin/Referer en mutaciones
       if (!["GET", "HEAD", "OPTIONS"].includes(request.method)) {
@@ -564,7 +573,7 @@ export default {
         } else {
           await env.DB.prepare("UPDATE users SET status='DEACTIVATED',deactivated_at=?1 WHERE id=?2 AND workshop_id=?3").bind(now(), userId, WORKSHOP_ID).run();
         }
-        await audit(env.DB, `user.${action}`, "user", userId);
+        await audit(env.DB, `user.${action}`, "user", userId, null, authenticatedSession.id);
         return json({ ok: true });
       }
 
@@ -581,7 +590,7 @@ export default {
         await env.DB.prepare(
           "UPDATE users SET role=?1 WHERE id=?2 AND workshop_id=?3"
         ).bind(role, userId, WORKSHOP_ID).run();
-        await audit(env.DB, "user.role_changed", "user", userId, { role });
+        await audit(env.DB, "user.role_changed", "user", userId, { role }, authenticatedSession.id);
         return json({ ok: true });
       }
 
@@ -611,7 +620,7 @@ export default {
             role=excluded.role,
             status='ACTIVE',updated_at=excluded.updated_at
         `).bind(id, WORKSHOP_ID, googleSub, email, role, authenticatedSession.id, now(), now()).run();
-        await audit(env.DB, "google_account.allowlisted", "google_account", id, { email, googleSub: Boolean(googleSub) });
+        await audit(env.DB, "google_account.allowlisted", "google_account", id, { email, googleSub: Boolean(googleSub) }, authenticatedSession.id);
         return json({ ok: true }, 201);
       }
 
@@ -642,7 +651,7 @@ export default {
         await env.DB.prepare(
           "DELETE FROM google_access_allowlist WHERE id=?1 AND workshop_id=?2"
         ).bind(accountId, WORKSHOP_ID).run();
-        await audit(env.DB, "google_account.removed", "google_account", accountId);
+        await audit(env.DB, "google_account.removed", "google_account", accountId, null, authenticatedSession.id);
         return json({ ok: true });
       }
 
@@ -708,7 +717,7 @@ export default {
           requireRole(authenticatedSession, "admin");
         }
 
-        if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
+        if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.OAUTH_TOKEN_ENCRYPTION_KEY) {
           return json({ error: "Google OAuth no está configurado. Pendiente de credenciales externas." }, 503);
         }
 
@@ -716,23 +725,27 @@ export default {
         const challenge = await sha256(verifier);
         const redirectUri = env.GOOGLE_REDIRECT_URI ?? `${url.origin}/api/auth/callback/google`;
         const csrf = randomToken(24);
-        const state = serializeOAuthState({
+        const state = await signOAuthState({
           csrfToken: csrf,
           userId: authenticatedSession.id,
           connectionType,
           workshopId: WORKSHOP_ID,
           timestamp: Date.now()
-        });
+        }, env.OAUTH_TOKEN_ENCRYPTION_KEY);
+        const service = connectionType === "WORKSHOP" ? "google_drive_workshop" : "google_drive_personal";
 
         await env.DB.prepare(
-          "INSERT INTO oauth_states (id,state,pkce_verifier_hash,pkce_verifier,user_id,service,redirect_uri,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
+          `INSERT INTO oauth_states
+            (id,state,csrf_token,pkce_verifier_hash,pkce_verifier,user_id,service,redirect_uri,expires_at,created_at)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)`
         ).bind(
           uuid(),
           state,
+          csrf,
           challenge,
           verifier,
           authenticatedSession.id,
-          connectionType === "WORKSHOP" ? "google_drive_workshop" : "google_drive_personal",
+          service,
           redirectUri,
           new Date(Date.now() + 10 * 60 * 1000).toISOString(),
           now()
@@ -764,14 +777,17 @@ export default {
         if (oauthError) return new Response(null, { status: 302, headers: { location: "/?google_error=consent_declined" } });
         if (!state || !code) return json({ error: "Respuesta OAuth incompleta" }, 400);
 
-        const parsedState = deserializeOAuthState(state);
-        if (!parsedState) return json({ error: "Estado OAuth manipulado o inválido" }, 400);
+        const verifiedState = env.OAUTH_TOKEN_ENCRYPTION_KEY
+          ? await verifyOAuthState(state, env.OAUTH_TOKEN_ENCRYPTION_KEY)
+          : null;
+        if (!verifiedState) return json({ error: "Estado OAuth manipulado o inválido" }, 400);
 
         const record = await env.DB.prepare(`
-          SELECT state,user_id,service,redirect_uri,pkce_verifier,expires_at,used_at
+          SELECT state,csrf_token,user_id,service,redirect_uri,pkce_verifier,expires_at,used_at
           FROM oauth_states WHERE state=?1
         `).bind(state).first<{
           state: string;
+          csrf_token: string | null;
           user_id: string;
           service: string;
           redirect_uri: string;
@@ -780,9 +796,21 @@ export default {
           used_at: string | null;
         }>();
 
-        if (!record || record.used_at || record.expires_at <= now() || record.user_id !== authenticatedSession.id) {
+        const connType: GoogleConnectionType = record?.service === "google_drive_workshop" ? "WORKSHOP" : "PERSONAL";
+        if (
+          !record ||
+          record.used_at ||
+          record.expires_at <= now() ||
+          record.user_id !== authenticatedSession.id ||
+          record.csrf_token !== verifiedState.csrfToken ||
+          verifiedState.userId !== authenticatedSession.id ||
+          verifiedState.workshopId !== WORKSHOP_ID ||
+          verifiedState.connectionType !== connType ||
+          Date.now() - verifiedState.timestamp > 10 * 60 * 1000
+        ) {
           return json({ error: "Estado OAuth inválido o expirado" }, 401);
         }
+        if (connType === "WORKSHOP") requireRole(authenticatedSession, "admin");
         if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
           return json({ error: "Google OAuth no está configurado" }, 503);
         }
@@ -836,9 +864,7 @@ export default {
           ? await encryptSecret(tokenBody.refresh_token, env.OAUTH_TOKEN_ENCRYPTION_KEY)
           : null;
         const expiresAt = new Date(Date.now() + (tokenBody.expires_in ?? 3600) * 1000).toISOString();
-        const connType: GoogleConnectionType = record.service === "google_drive_workshop" ? "WORKSHOP" : "PERSONAL";
-        if (connType === "WORKSHOP") requireRole(authenticatedSession, "admin");
-        const service = connType === "WORKSHOP" ? "google_drive_workshop" : "google_drive_personal";
+        const service = record.service;
 
         await env.DB.prepare(`
           INSERT INTO google_connections (
@@ -879,7 +905,7 @@ export default {
         await audit(env.DB, "google_drive.connected", "integration", authenticatedSession.id, {
           connectionType: connType,
           email: accountEmail
-        });
+        }, authenticatedSession.id);
 
         return new Response(null, {
           status: 302,
@@ -913,92 +939,11 @@ export default {
           `).bind(now(), authenticatedSession.id).run();
         }
 
-        await audit(env.DB, "google_drive.disconnected", "integration", authenticatedSession.id, { connectionType });
+        await audit(env.DB, "google_drive.disconnected", "integration", authenticatedSession.id, { connectionType }, authenticatedSession.id);
         return json({ ok: true });
       }
 
-      if (url.pathname === "/api/integrations/google/picker-token" && request.method === "GET") {
-        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
-        requireRole(authenticatedSession, "reception", "technician", "technical_lead", "cashier");
-        const connType = (url.searchParams.get("connectionType") === "PERSONAL" ? "PERSONAL" : "WORKSHOP") as GoogleConnectionType;
-        if (connType === "WORKSHOP") requireRole(authenticatedSession, "admin");
-
-        let conn = null;
-        if (connType === "WORKSHOP") {
-          conn = await env.DB.prepare(`
-            SELECT id, account_email, access_token_encrypted, refresh_token_encrypted, expires_at
-            FROM google_connections
-            WHERE workshop_id=?1 AND connection_type='WORKSHOP' AND status='connected'
-            LIMIT 1
-          `).bind(WORKSHOP_ID).first<{
-            id: string;
-            account_email: string | null;
-            access_token_encrypted: string | null;
-            refresh_token_encrypted: string | null;
-            expires_at: string | null;
-          }>();
-        } else {
-          conn = await env.DB.prepare(`
-            SELECT id, account_email, access_token_encrypted, refresh_token_encrypted, expires_at
-            FROM google_connections
-            WHERE user_id=?1 AND connection_type='PERSONAL' AND status='connected'
-            LIMIT 1
-          `).bind(authenticatedSession.id).first<{
-            id: string;
-            account_email: string | null;
-            access_token_encrypted: string | null;
-            refresh_token_encrypted: string | null;
-            expires_at: string | null;
-          }>();
-        }
-
-        if (!conn || !conn.access_token_encrypted) {
-          return json({ error: `No hay cuenta de Google Drive (${connType}) conectada` }, 404);
-        }
-
-        if (!env.OAUTH_TOKEN_ENCRYPTION_KEY) {
-          return json({ error: "Falta configuración de cifrado" }, 503);
-        }
-
-        let accessToken: string;
-        if (conn.expires_at && isTokenExpired(conn.expires_at)) {
-          if (!conn.refresh_token_encrypted || !env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
-            return json({ error: "Token de acceso expirado y no se puede renovar automáticamente" }, 401);
-          }
-          const refreshToken = await decryptSecret(conn.refresh_token_encrypted, env.OAUTH_TOKEN_ENCRYPTION_KEY);
-          const refreshRes = await fetch("https://oauth2.googleapis.com/token", {
-            method: "POST",
-            headers: { "content-type": "application/x-www-form-urlencoded" },
-            body: new URLSearchParams({
-              client_id: env.GOOGLE_CLIENT_ID,
-              client_secret: env.GOOGLE_CLIENT_SECRET,
-              refresh_token: refreshToken,
-              grant_type: "refresh_token"
-            })
-          });
-          const refreshBody = await refreshRes.json() as { access_token?: string; expires_in?: number; error?: string };
-          if (!refreshRes.ok || !refreshBody.access_token) {
-            return json({ error: refreshBody.error ?? "No se pudo renovar el token de Google" }, 502);
-          }
-          accessToken = refreshBody.access_token;
-          const accessEncrypted = await encryptSecret(accessToken, env.OAUTH_TOKEN_ENCRYPTION_KEY);
-          const newExpiresAt = new Date(Date.now() + (refreshBody.expires_in ?? 3600) * 1000).toISOString();
-          await env.DB.prepare(`
-            UPDATE google_connections
-            SET access_token_encrypted=?1, expires_at=?2, updated_at=?3
-            WHERE id=?4 AND workshop_id=?5
-          `).bind(accessEncrypted, newExpiresAt, now(), conn.id, WORKSHOP_ID).run();
-        } else {
-          accessToken = await decryptSecret(conn.access_token_encrypted, env.OAUTH_TOKEN_ENCRYPTION_KEY);
-        }
-
-        return json({
-          accessToken,
-          email: conn.account_email,
-          connectionType: connType,
-          appId: env.GOOGLE_CLIENT_ID ? env.GOOGLE_CLIENT_ID.split("-")[0] : null
-        });
-      }
+      // Google access tokens remain server-side: no endpoint returns a raw access token.
 
       // --- Order Attachments & Photos Endpoints ---
       const orderAttachmentsMatch = url.pathname.match(/^\/api\/orders\/([^/]+)\/attachments$/);
@@ -1098,7 +1043,7 @@ export default {
           category,
           fileName: sanitizedName,
           fileSize: file.size
-        });
+        }, authenticatedSession.id);
 
         return json({
           id: attachmentId,
@@ -1229,7 +1174,7 @@ export default {
           driveFileId,
           fileName,
           origin
-        });
+        }, authenticatedSession.id);
 
         return json({
           id: attachmentId,
@@ -1276,7 +1221,7 @@ export default {
           "UPDATE order_attachments SET deleted_at=?1 WHERE id=?2 AND workshop_id=?3"
         ).bind(now(), attachmentId, WORKSHOP_ID).run();
 
-        await audit(env.DB, "order.attachment_deleted", "order_attachment", attachmentId, { orderId });
+        await audit(env.DB, "order.attachment_deleted", "order_attachment", attachmentId, { orderId }, authenticatedSession.id);
         return json({ ok: true });
       }
 
@@ -1288,9 +1233,12 @@ export default {
           env.DB.prepare("SELECT COUNT(*) AS count FROM devices WHERE workshop_id=?1").bind(WORKSHOP_ID).first<number>("count"),
           env.DB.prepare(`
             SELECT p.id,p.sku,p.name,p.minimum_stock,
-              COALESCE(SUM(CASE WHEN sm.kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN sm.quantity ELSE -sm.quantity END),0) AS stock
-            FROM parts p LEFT JOIN stock_movements sm ON sm.part_id=p.id AND sm.workshop_id=p.workshop_id
-            WHERE p.workshop_id=?1 AND p.status='ACTIVO' GROUP BY p.id HAVING stock <= p.minimum_stock
+              ${STOCK_SQL} AS stock,
+              ${RESERVED_SQL} AS reserved,
+              ${STOCK_SQL} - ${RESERVED_SQL} AS available
+            FROM parts p
+            WHERE p.workshop_id=?1 AND p.status='ACTIVO'
+              AND ${STOCK_SQL} - ${RESERVED_SQL} <= p.minimum_stock
           `).bind(WORKSHOP_ID).all(),
           env.DB.prepare("SELECT COALESCE(SUM(CASE WHEN kind='REFUND' THEN -amount_minor ELSE amount_minor END),0) AS total FROM payment_transactions WHERE workshop_id=?1").bind(WORKSHOP_ID).first<number>("total")
         ]);
@@ -1337,7 +1285,7 @@ export default {
           body.observations ? text(body.observations, "Observaciones") : null,
           authenticatedSession.id, timestamp, timestamp
         ).run();
-        await audit(env.DB, "customer.created", "customer", id, { name: body.name });
+        await audit(env.DB, "customer.created", "customer", id, { name: body.name }, authenticatedSession.id);
         return json({ id }, 201);
       }
 
@@ -1395,7 +1343,7 @@ export default {
           "ACTIVO",
           now(), customerId, WORKSHOP_ID
         ).run();
-        await audit(env.DB, "customer.updated", "customer", customerId);
+        await audit(env.DB, "customer.updated", "customer", customerId, null, authenticatedSession.id);
         return json({ ok: true });
       }
 
@@ -1471,7 +1419,7 @@ export default {
         await env.DB.prepare(
           "INSERT INTO devices (id,workshop_id,customer_id,category,brand,model,serial_number,physical_condition,reported_fault,accessories,owner_user_id,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"
         ).bind(id, WORKSHOP_ID, customerId, text(body.category, "Categoría"), text(body.brand, "Marca"), text(body.model, "Modelo"), body.serialNumber ? text(body.serialNumber, "Serie/IMEI") : null, body.physicalCondition ? text(body.physicalCondition, "Condición") : null, body.reportedFault ? text(body.reportedFault, "Falla") : null, body.accessories ? text(body.accessories, "Accesorios") : null, authenticatedSession.id, now()).run();
-        await audit(env.DB, "device.created", "device", id);
+        await audit(env.DB, "device.created", "device", id, null, authenticatedSession.id);
         return json({ id }, 201);
       }
 
@@ -1640,7 +1588,7 @@ export default {
             orderId, WORKSHOP_ID
           )
         ]);
-        await audit(env.DB, "order.updated", "repair_order", orderId, { corrected: true });
+        await audit(env.DB, "order.updated", "repair_order", orderId, { corrected: true }, authenticatedSession.id);
         return json({ ok: true });
       }
 
@@ -1668,7 +1616,7 @@ export default {
           env.DB.prepare("DELETE FROM repair_orders WHERE id=?1 AND workshop_id=?2").bind(orderId, WORKSHOP_ID),
           env.DB.prepare("DELETE FROM devices WHERE id=?1 AND workshop_id=?2 AND NOT EXISTS (SELECT 1 FROM repair_orders WHERE device_id=?1)").bind(order.device_id, WORKSHOP_ID)
         ]);
-        await audit(env.DB, "order.deleted", "repair_order", orderId, { duplicateCorrection: true });
+        await audit(env.DB, "order.deleted", "repair_order", orderId, { duplicateCorrection: true }, authenticatedSession.id);
         return json({ ok: true });
       }
 
@@ -1703,7 +1651,9 @@ export default {
             "INSERT INTO order_status_events (id,workshop_id,order_id,from_status,to_status,actor_id,reason,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
           ).bind(uuid(), WORKSHOP_ID, orderId, order.status, toStatus, authenticatedSession.id, body.reason ? text(body.reason, "Motivo") : null, timestamp)
         ]);
-        await audit(env.DB, "order.status_changed", "repair_order", orderId, { from: order.status, to: toStatus }, authenticatedSession.id);
+        await audit(env.DB, "order.status_changed", "repair_order", orderId,
+          { from: order.status, to: toStatus }, authenticatedSession.id,
+          { status: order.status }, { status: toStatus });
         return json({ status: toStatus });
       }
 
@@ -1772,7 +1722,8 @@ export default {
         const quote = await env.DB.prepare("SELECT id FROM quote_versions WHERE id=?1 AND order_id=?2 AND workshop_id=?3 AND status='draft'").bind(quoteId, orderId, WORKSHOP_ID).first("id");
         if (!quote) return json({ error: "Presupuesto no encontrado o no está en borrador" }, 404);
         await env.DB.prepare("UPDATE quote_versions SET status='approved' WHERE id=?1 AND order_id=?2 AND workshop_id=?3 AND status='draft'").bind(quoteId, orderId, WORKSHOP_ID).run();
-        await audit(env.DB, "quote.approved", "quote", quoteId, { orderId }, actor.id);
+        await audit(env.DB, "quote.approved", "quote", quoteId, { orderId }, actor.id,
+          { status: "draft" }, { status: "approved" });
         return json({ id: quoteId, status: "approved" });
       }
 
@@ -1790,7 +1741,8 @@ export default {
         await env.DB.prepare(
           "INSERT INTO payment_transactions (id,workshop_id,order_id,kind,amount_minor,method,reference,actor_id,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
         ).bind(id, WORKSHOP_ID, orderId, kind, amount, text(body.method, "Método"), body.reference ? text(body.reference, "Referencia") : null, actor.id, now()).run();
-        await audit(env.DB, kind === "REFUND" ? "payment.refunded" : "payment.created", "payment", id, { amountMinor: amount }, actor.id);
+        await audit(env.DB, kind === "REFUND" ? "payment.refunded" : "payment.created", "payment", id,
+          { amountMinor: amount }, actor.id, null, { orderId, kind, amountMinor: amount });
         return json({ id }, 201);
       }
 
@@ -2327,9 +2279,11 @@ export default {
         const result = await env.DB.prepare(`
           SELECT p.id,p.sku,p.name,p.category,p.location,p.cost_minor,p.sale_price_minor,p.minimum_stock,
                  p.status,p.archived_at,p.created_at,p.updated_at,
-            COALESCE(SUM(CASE WHEN sm.kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN sm.quantity ELSE -sm.quantity END),0) AS stock
-          FROM parts p LEFT JOIN stock_movements sm ON sm.part_id=p.id AND sm.workshop_id=p.workshop_id
-          WHERE p.workshop_id=?1 GROUP BY p.id ORDER BY
+                 ${STOCK_SQL} AS stock,
+                 ${RESERVED_SQL} AS reserved,
+                 ${STOCK_SQL} - ${RESERVED_SQL} AS available
+          FROM parts p
+          WHERE p.workshop_id=?1 ORDER BY
             CASE WHEN p.status='ACTIVO' THEN 0 ELSE 1 END,
             p.name
         `).bind(WORKSHOP_ID).all();
@@ -2362,33 +2316,30 @@ export default {
           );
         }
         await env.DB.batch(statements);
-        await audit(env.DB, "part.created", "part", id, { initialStock });
+        await audit(env.DB, "part.created", "part", id, { initialStock }, authenticatedSession.id);
         return json({ id }, 201);
       }
 
       const movementMatch = url.pathname.match(/^\/api\/parts\/([^/]+)\/movements$/);
       if (movementMatch && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para registrar movimientos" }, 401);
-        requireRole(authenticatedSession, "reception", "technician", "technical_lead", "admin");
+        const actor = requireRole(authenticatedSession, "reception", "technician", "technical_lead", "admin");
         const body = await readJson(request);
         const partId = movementMatch[1];
-        const reference = body.reference ? text(body.reference, "Referencia") : null;
-        if (reference) {
-          const existing = await env.DB.prepare(
-            "SELECT id,stock_after FROM stock_movements WHERE reference=?1"
-          ).bind(reference).first<{ id: string; stock_after: number }>();
-          if (existing) return json({ id: existing.id, stock: existing.stock_after, duplicated: true });
-        }
         const part = await env.DB.prepare(
           "SELECT id,status FROM parts WHERE id=?1 AND workshop_id=?2"
         ).bind(partId, WORKSHOP_ID).first<{ id: string; status: string }>();
         if (!part) return json({ error: "Repuesto no encontrado" }, 404);
         if (part.status === "ARCHIVADO") return json({ error: "Reactiva el producto antes de registrar movimientos" }, 409);
-        const stockRow = await env.DB.prepare(`
-          SELECT COALESCE(SUM(CASE WHEN kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN quantity ELSE -quantity END),0) AS stock
-          FROM stock_movements WHERE part_id=?1 AND workshop_id=?2
-        `).bind(partId, WORKSHOP_ID).first<{ stock: number }>();
-        const stock = stockRow?.stock ?? 0;
+        const state = await env.DB.prepare(`
+          SELECT
+            COALESCE((SELECT SUM(CASE WHEN kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN quantity ELSE -quantity END)
+              FROM stock_movements WHERE part_id=?1 AND workshop_id=?2),0) AS stock,
+            COALESCE((SELECT SUM(quantity) FROM part_reservations
+              WHERE part_id=?1 AND workshop_id=?2 AND status='ACTIVE'),0) AS reserved
+        `).bind(partId, WORKSHOP_ID).first<{ stock: number; reserved: number }>();
+        const stock = state?.stock ?? 0;
+        const reserved = state?.reserved ?? 0;
         let orderId: string | null = null;
         if (body.orderId) {
           orderId = text(body.orderId, "Orden");
@@ -2396,7 +2347,7 @@ export default {
             "SELECT id,workshop_id,assigned_user_id,owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
           ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; assigned_user_id: string | null; owner_user_id: string | null }>();
           if (!order) return json({ error: "Orden no encontrada" }, 404);
-          requireOrderAccess(authenticatedSession, order);
+          requireOrderAccess(actor, order);
         }
         const requestedKind = body.kind ? text(body.kind, "Tipo").toUpperCase() : null;
         let kind: string;
@@ -2414,19 +2365,36 @@ export default {
         }
         const allowed = ["IN", "OUT", "RETURN", "ADJUSTMENT_IN", "ADJUSTMENT_OUT"];
         if (!allowed.includes(kind)) throw new Error("Tipo de movimiento inválido");
-        const stockAfter = stock + (["IN", "RETURN", "ADJUSTMENT_IN"].includes(kind) ? quantity : -quantity);
-        if (stockAfter < 0) return json({ error: "Stock insuficiente" }, 409);
+        const delta = ["IN", "RETURN", "ADJUSTMENT_IN"].includes(kind) ? quantity : -quantity;
+        const stockAfter = stock + delta;
+        if (stockAfter < 0 || stockAfter < reserved) return json({ error: "Stock insuficiente" }, 409);
         const id = uuid();
-        await env.DB.batch([
-          env.DB.prepare(
-            "INSERT INTO stock_movements (id,workshop_id,part_id,order_id,kind,quantity,reason,actor_id,created_at,stock_before,stock_after,reference) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"
-          ).bind(id, WORKSHOP_ID, partId, orderId, kind, quantity, text(body.reason, "Motivo"), authenticatedSession.id, now(), stock, stockAfter, reference),
-          env.DB.prepare(
-            "UPDATE parts SET updated_at=?1 WHERE id=?2 AND workshop_id=?3"
-          ).bind(now(), partId, WORKSHOP_ID)
-        ]);
-        await audit(env.DB, "stock.movement", "stock_movement", id, { kind, quantity });
-        return json({ id, stockBefore: stock, stockAfter, duplicated: false }, 201);
+        const reference = `mov:${id}`;
+        const reason = text(body.reason, "Motivo");
+        const timestamp = now();
+        // Atomic guard: insert only if stock and reservations still match the values just read.
+        const inserted = await env.DB.prepare(`
+          WITH current AS (
+            SELECT
+              COALESCE((SELECT SUM(CASE WHEN kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN quantity ELSE -quantity END)
+                FROM stock_movements WHERE part_id=?1 AND workshop_id=?2),0) AS stock,
+              COALESCE((SELECT SUM(quantity) FROM part_reservations
+                WHERE part_id=?1 AND workshop_id=?2 AND status='ACTIVE'),0) AS reserved
+            )
+          INSERT INTO stock_movements
+            (id,workshop_id,part_id,order_id,kind,quantity,reason,actor_id,created_at,stock_before,stock_after,reference)
+          SELECT ?3,?2,?1,?4,?5,?6,?7,?8,?9,current.stock,current.stock+?10,?11
+          FROM current
+          WHERE current.stock=?12 AND current.reserved=?13 AND current.stock+?10>=0 AND current.stock+?10>=current.reserved
+        `).bind(partId, WORKSHOP_ID, id, orderId, kind, quantity, reason, actor.id, timestamp, delta, reference, stock, reserved).run() as { meta?: { changes?: number } };
+        if ((inserted.meta?.changes ?? 0) !== 1) {
+          return json({ error: "El stock cambió durante la operación. Reintentá con datos actualizados." }, 409);
+        }
+        await env.DB.prepare("UPDATE parts SET updated_at=?1 WHERE id=?2 AND workshop_id=?3")
+          .bind(timestamp, partId, WORKSHOP_ID).run();
+        await audit(env.DB, "stock.movement", "stock_movement", id, { kind, quantity, reference }, actor.id,
+          { stock, reserved, available: stock - reserved }, { stock: stockAfter, reserved, available: stockAfter - reserved });
+        return json({ id, reference, stockBefore: stock, stockAfter, reserved, available: stockAfter - reserved }, 201);
       }
 
       if (url.pathname === "/api/inventory/movements" && request.method === "GET") {
@@ -2464,45 +2432,151 @@ export default {
         return json({ movements: movements.results });
       }
 
+      const reservationCollectionMatch = url.pathname.match(/^\/api\/parts\/([^/]+)\/reservations$/);
+      if (reservationCollectionMatch && request.method === "GET") {
+        if (!authenticatedSession) return json({ error: "Autenticación requerida" }, 401);
+        const partId = reservationCollectionMatch[1];
+        const part = await env.DB.prepare("SELECT id FROM parts WHERE id=?1 AND workshop_id=?2").bind(partId, WORKSHOP_ID).first("id");
+        if (!part) return json({ error: "Repuesto no encontrado" }, 404);
+        const reservations = await env.DB.prepare(`
+          SELECT pr.id,pr.part_id,pr.order_id,pr.quantity,pr.reason,pr.status,pr.reference,pr.created_at,
+                 ro.reference AS order_reference
+          FROM part_reservations pr
+          LEFT JOIN repair_orders ro ON ro.id=pr.order_id AND ro.workshop_id=pr.workshop_id
+          WHERE pr.workshop_id=?1 AND pr.part_id=?2 AND pr.status='ACTIVE'
+          ORDER BY pr.created_at DESC
+        `).bind(WORKSHOP_ID, partId).all();
+        return json({ reservations: reservations.results });
+      }
+
+      if (reservationCollectionMatch && request.method === "POST") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para reservar repuestos" }, 401);
+        const actor = requireRole(authenticatedSession, "reception", "technician", "technical_lead", "admin");
+        const body = await readJson(request);
+        const partId = reservationCollectionMatch[1];
+        const part = await env.DB.prepare("SELECT id,status FROM parts WHERE id=?1 AND workshop_id=?2").bind(partId, WORKSHOP_ID).first<{ id: string; status: string }>();
+        if (!part) return json({ error: "Repuesto no encontrado" }, 404);
+        if (part.status !== "ACTIVO") return json({ error: "El repuesto no está activo" }, 409);
+        const quantity = integer(body.quantity, "Cantidad");
+        if (quantity <= 0) throw new Error("La cantidad debe ser positiva");
+        const reason = text(body.reason, "Motivo");
+        let orderId: string | null = null;
+        if (body.orderId) {
+          orderId = text(body.orderId, "Orden");
+          const order = await env.DB.prepare(
+            "SELECT id,workshop_id,assigned_user_id,owner_user_id FROM repair_orders WHERE id=?1 AND workshop_id=?2"
+          ).bind(orderId, WORKSHOP_ID).first<{ id: string; workshop_id: string; assigned_user_id: string | null; owner_user_id: string | null }>();
+          if (!order) return json({ error: "Orden no encontrada" }, 404);
+          requireOrderAccess(actor, order);
+        }
+        const state = await env.DB.prepare(`
+          SELECT
+            COALESCE((SELECT SUM(CASE WHEN kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN quantity ELSE -quantity END)
+              FROM stock_movements WHERE part_id=?1 AND workshop_id=?2),0) AS stock,
+            COALESCE((SELECT SUM(quantity) FROM part_reservations
+              WHERE part_id=?1 AND workshop_id=?2 AND status='ACTIVE'),0) AS reserved
+        `).bind(partId, WORKSHOP_ID).first<{ stock: number; reserved: number }>();
+        const stock = state?.stock ?? 0;
+        const reservedBefore = state?.reserved ?? 0;
+        if (reservedBefore + quantity > stock) return json({ error: "Stock disponible insuficiente" }, 409);
+        const id = uuid();
+        const reference = `res:${id}`;
+        const inserted = await env.DB.prepare(`
+          WITH current AS (
+            SELECT
+              COALESCE((SELECT SUM(CASE WHEN kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN quantity ELSE -quantity END)
+                FROM stock_movements WHERE part_id=?1 AND workshop_id=?2),0) AS stock,
+              COALESCE((SELECT SUM(quantity) FROM part_reservations
+                WHERE part_id=?1 AND workshop_id=?2 AND status='ACTIVE'),0) AS reserved
+            )
+          INSERT INTO part_reservations
+            (id,workshop_id,part_id,order_id,quantity,reason,status,reference,actor_id,created_at)
+          SELECT ?3,?2,?1,?4,?5,?6,'ACTIVE',?7,?8,?9
+          FROM current
+          WHERE current.reserved=?10 AND current.reserved+?5<=current.stock
+        `).bind(partId, WORKSHOP_ID, id, orderId, quantity, reason, reference, actor.id, now(), reservedBefore).run() as { meta?: { changes?: number } };
+        if ((inserted.meta?.changes ?? 0) !== 1) {
+          return json({ error: "El stock o las reservas cambiaron durante la operación" }, 409);
+        }
+        await audit(env.DB, "part.reserved", "part_reservation", id,
+          { orderId, quantity, reference }, actor.id,
+          { stock, reserved: reservedBefore, available: stock - reservedBefore },
+          { stock, reserved: reservedBefore + quantity, available: stock - reservedBefore - quantity });
+        return json({ id, reference, quantity, reserved: reservedBefore + quantity, available: stock - reservedBefore - quantity }, 201);
+      }
+
+      const reservationReleaseMatch = url.pathname.match(/^\/api\/parts\/([^/]+)\/reservations\/([^/]+)$/);
+      if (reservationReleaseMatch && request.method === "DELETE") {
+        if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para liberar reservas" }, 401);
+        const actor = requireRole(authenticatedSession, "reception", "technician", "technical_lead", "admin");
+        const partId = reservationReleaseMatch[1];
+        const reservationId = reservationReleaseMatch[2];
+        const reservation = await env.DB.prepare(`
+          SELECT id,quantity,status FROM part_reservations
+          WHERE id=?1 AND part_id=?2 AND workshop_id=?3 AND status='ACTIVE'
+        `).bind(reservationId, partId, WORKSHOP_ID).first<{ id: string; quantity: number; status: string }>();
+        if (!reservation) return json({ error: "Reserva no encontrada" }, 404);
+        const released = await env.DB.prepare(`
+          UPDATE part_reservations SET status='RELEASED',released_at=?1
+          WHERE id=?2 AND part_id=?3 AND workshop_id=?4 AND status='ACTIVE'
+        `).bind(now(), reservationId, partId, WORKSHOP_ID).run() as { meta?: { changes?: number } };
+        if ((released.meta?.changes ?? 0) !== 1) return json({ error: "La reserva ya fue liberada" }, 409);
+        await audit(env.DB, "part.reservation_released", "part_reservation", reservationId,
+          { partId, quantity: reservation.quantity }, actor.id);
+        return json({ id: reservationId, status: "RELEASED" });
+      }
+
       const movementReverseMatch = url.pathname.match(/^\/api\/inventory\/movements\/([^/]+)\/reverse$/);
       if (movementReverseMatch && request.method === "POST") {
         if (!authenticatedSession) return json({ error: "Se requiere una sesión aprobada para revertir movimientos" }, 401);
-        requireRole(authenticatedSession, "reception", "technician", "technical_lead", "admin");
+        const actor = requireRole(authenticatedSession, "reception", "technician", "technical_lead", "admin");
         const movementId = movementReverseMatch[1];
         const original = await env.DB.prepare(`
           SELECT id,part_id,kind,quantity,reference
           FROM stock_movements WHERE id=?1 AND workshop_id=?2
         `).bind(movementId, WORKSHOP_ID).first<{ id: string; part_id: string; kind: string; quantity: number; reference: string | null }>();
         if (!original) return json({ error: "Movimiento no encontrado" }, 404);
-        const reverseReference = `reverse:${original.id}`;
-        const existing = await env.DB.prepare(
-          "SELECT id,stock_after FROM stock_movements WHERE reference=?1"
-        ).bind(reverseReference).first<{ id: string; stock_after: number }>();
-        if (existing) return json({ id: existing.id, stock: existing.stock_after, duplicated: true });
-        const stockRow = await env.DB.prepare(`
-          SELECT COALESCE(SUM(CASE WHEN kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN quantity ELSE -quantity END),0) AS stock
-          FROM stock_movements WHERE part_id=?1 AND workshop_id=?2
-        `).bind(original.part_id, WORKSHOP_ID).first<{ stock: number }>();
-        const stockBefore = stockRow?.stock ?? 0;
+        const state = await env.DB.prepare(`
+          SELECT
+            COALESCE((SELECT SUM(CASE WHEN kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN quantity ELSE -quantity END)
+              FROM stock_movements WHERE part_id=?1 AND workshop_id=?2),0) AS stock,
+            COALESCE((SELECT SUM(quantity) FROM part_reservations
+              WHERE part_id=?1 AND workshop_id=?2 AND status='ACTIVE'),0) AS reserved
+        `).bind(original.part_id, WORKSHOP_ID).first<{ stock: number; reserved: number }>();
+        const stockBefore = state?.stock ?? 0;
+        const reserved = state?.reserved ?? 0;
         const reverseKind = ["OUT", "ADJUSTMENT_OUT"].includes(original.kind) ? "IN" : "OUT";
-        const stockAfter = stockBefore + (reverseKind === "IN" ? original.quantity : -original.quantity);
-        if (stockAfter < 0) return json({ error: "No hay stock suficiente para revertir el movimiento" }, 409);
+        const delta = reverseKind === "IN" ? original.quantity : -original.quantity;
+        const stockAfter = stockBefore + delta;
+        if (stockAfter < 0 || stockAfter < reserved) return json({ error: "No hay stock suficiente para revertir el movimiento" }, 409);
         const id = uuid();
-        await env.DB.batch([
-          env.DB.prepare(`
-            INSERT INTO stock_movements
-              (id,workshop_id,part_id,order_id,kind,quantity,reason,actor_id,created_at,stock_before,stock_after,reference)
-            VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,?11)
-          `).bind(
-            id, WORKSHOP_ID, original.part_id, reverseKind, original.quantity,
-            `Reversión compensatoria del movimiento ${original.id}`,
-            authenticatedSession.id, now(), stockBefore, stockAfter, reverseReference
-          ),
-          env.DB.prepare("UPDATE parts SET updated_at=?1 WHERE id=?2 AND workshop_id=?3")
-            .bind(now(), original.part_id, WORKSHOP_ID)
-        ]);
-        await audit(env.DB, "stock.movement.reversed", "stock_movement", original.id, { reverseId: id });
-        return json({ id, stockBefore, stockAfter, reversed: original.id }, 201);
+        const reference = `reverse:${id}`;
+        const timestamp = now();
+        const inserted = await env.DB.prepare(`
+          WITH current AS (
+            SELECT
+              COALESCE((SELECT SUM(CASE WHEN kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN quantity ELSE -quantity END)
+                FROM stock_movements WHERE part_id=?1 AND workshop_id=?2),0) AS stock,
+              COALESCE((SELECT SUM(quantity) FROM part_reservations
+                WHERE part_id=?1 AND workshop_id=?2 AND status='ACTIVE'),0) AS reserved
+            )
+          INSERT INTO stock_movements
+            (id,workshop_id,part_id,order_id,kind,quantity,reason,actor_id,created_at,stock_before,stock_after,reference)
+          SELECT ?3,?2,?1,NULL,?4,?5,?6,?7,?8,current.stock,current.stock+?9,?10
+          FROM current
+          WHERE current.stock=?11 AND current.reserved=?12 AND current.stock+?9>=0 AND current.stock+?9>=current.reserved
+        `).bind(original.part_id, WORKSHOP_ID, id, reverseKind, original.quantity,
+          `Reversión compensatoria del movimiento ${original.id}`, actor.id, timestamp, delta, reference, stockBefore, reserved).run() as { meta?: { changes?: number } };
+        if ((inserted.meta?.changes ?? 0) !== 1) {
+          return json({ error: "El stock cambió durante la reversión. Reintentá." }, 409);
+        }
+        await env.DB.prepare("UPDATE parts SET updated_at=?1 WHERE id=?2 AND workshop_id=?3")
+          .bind(timestamp, original.part_id, WORKSHOP_ID).run();
+        await audit(env.DB, "stock.movement.reversed", "stock_movement", original.id,
+          { reverseId: id, reference, reversedReference: original.reference }, actor.id,
+          { stock: stockBefore, reserved, available: stockBefore - reserved },
+          { stock: stockAfter, reserved, available: stockAfter - reserved });
+        return json({ id, reference, stockBefore, stockAfter, reversed: original.id }, 201);
       }
 
       const partStatusMatch = url.pathname.match(/^\/api\/parts\/([^/]+)\/status$/);
@@ -2520,7 +2594,7 @@ export default {
           UPDATE parts SET status=?1,archived_at=?2,updated_at=?3
           WHERE id=?4 AND workshop_id=?5
         `).bind(status, status === "ARCHIVADO" ? timestamp : null, timestamp, partId, WORKSHOP_ID).run();
-        await audit(env.DB, `part.status_${status.toLowerCase()}`, "part", partId, { status });
+        await audit(env.DB, `part.status_${status.toLowerCase()}`, "part", partId, { status }, authenticatedSession.id);
         return json({ status });
       }
 
@@ -2531,9 +2605,11 @@ export default {
         const part = await env.DB.prepare(`
           SELECT p.id,p.sku,p.name,p.category,p.location,p.cost_minor,p.sale_price_minor,p.minimum_stock,
                  p.status,p.archived_at,p.created_at,p.updated_at,
-                 COALESCE(SUM(CASE WHEN sm.kind IN ('IN','RETURN','ADJUSTMENT_IN') THEN sm.quantity ELSE -sm.quantity END),0) AS stock
-          FROM parts p LEFT JOIN stock_movements sm ON sm.part_id=p.id AND sm.workshop_id=p.workshop_id
-          WHERE p.id=?1 AND p.workshop_id=?2 GROUP BY p.id
+                 ${STOCK_SQL} AS stock,
+                 ${RESERVED_SQL} AS reserved,
+                 ${STOCK_SQL} - ${RESERVED_SQL} AS available
+          FROM parts p
+          WHERE p.id=?1 AND p.workshop_id=?2
         `).bind(partId, WORKSHOP_ID).first();
         if (!part) return json({ error: "Repuesto no encontrado" }, 404);
         const movements = await env.DB.prepare(`
@@ -2572,7 +2648,7 @@ export default {
           integer(body.minimumStock ?? 0, "Stock mínimo"),
           now(), partId, WORKSHOP_ID
         ).run();
-        await audit(env.DB, "part.updated", "part", partId);
+        await audit(env.DB, "part.updated", "part", partId, null, authenticatedSession.id);
         return json({ ok: true });
       }
 
@@ -2584,24 +2660,18 @@ export default {
           "SELECT id, status FROM parts WHERE id=?1 AND workshop_id=?2"
         ).bind(partId, WORKSHOP_ID).first<{ id: string; status: string }>();
         if (!part) return json({ error: "Repuesto no encontrado" }, 404);
-        // Solo se permite eliminar productos archivados; si tiene movimientos, se eliminan en cascada.
-        if (part.status !== "ARCHIVADO") {
-          const movements = await env.DB.prepare(
-            "SELECT COUNT(*) AS count FROM stock_movements WHERE part_id=?1 AND workshop_id=?2"
-          ).bind(partId, WORKSHOP_ID).first<number>("count");
-          if ((movements ?? 0) > 0) {
-            return json({ error: "No se puede eliminar: el repuesto tiene movimientos de stock registrados. Archívalo primero." }, 409);
-          }
-        } else {
-          // Producto archivado: eliminar movimientos y luego el producto.
-          await env.DB.prepare(
-            "DELETE FROM stock_movements WHERE part_id=?1 AND workshop_id=?2"
-          ).bind(partId, WORKSHOP_ID).run();
+        const dependencies = await env.DB.prepare(`
+          SELECT
+            (SELECT COUNT(*) FROM stock_movements WHERE part_id=?1 AND workshop_id=?2) AS movements,
+            (SELECT COUNT(*) FROM part_reservations WHERE part_id=?1 AND workshop_id=?2) AS reservations
+        `).bind(partId, WORKSHOP_ID).first<{ movements: number; reservations: number }>();
+        if ((dependencies?.movements ?? 0) > 0 || (dependencies?.reservations ?? 0) > 0) {
+          return json({ error: "No se puede eliminar: el historial y las reservas son inmutables. Archivalo para retirarlo del uso." }, 409);
         }
         const deleted = await env.DB.prepare(
           "DELETE FROM parts WHERE id=?1 AND workshop_id=?2"
         ).bind(partId, WORKSHOP_ID).run();
-        await audit(env.DB, "part.deleted", "part", partId);
+        await audit(env.DB, "part.deleted", "part", partId, null, authenticatedSession.id);
         return json({ ok: true, deleted: Boolean(deleted) });
       }
 
